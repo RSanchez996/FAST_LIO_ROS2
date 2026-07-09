@@ -74,4 +74,10 @@
             # En robot real evita errores de extrapolación entre FAST-LIO y odom del Go2.
             use_latest_robot_tf: true
 
-            tf_timeout_sec: 0.05                                        
+            tf_timeout_sec: 0.05        
+            # true = map coincide con odom al inicio.
+            # El origen y orientación inicial de map serán los de odom, no los de camera_init/FAST-LIO.
+            align_map_to_odom_on_start: true 
+            # true = map -> odom sólo tendrá x, y, yaw.
+            # Recomendado para Nav2 2D.
+            project_map_to_2d: true                         

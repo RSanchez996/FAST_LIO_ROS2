@@ -58,6 +58,7 @@
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/time.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -228,8 +229,66 @@ void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
     po->intensity = pi->intensity;
 }
 
-void points_cache_collect()
-{
+tf2::Transform make_lio_tracking_transform(){
+    tf2::Transform T_lio_tracking;
+    T_lio_tracking.setOrigin(tf2::Vector3(
+        state_point.pos(0),
+        state_point.pos(1),
+        state_point.pos(2)));
+
+    tf2::Quaternion q_lio_tracking(
+        state_point.rot.coeffs()[0],
+        state_point.rot.coeffs()[1],
+        state_point.rot.coeffs()[2],
+        state_point.rot.coeffs()[3]);
+    q_lio_tracking.normalize();
+
+    T_lio_tracking.setRotation(q_lio_tracking);
+    return T_lio_tracking;
+}
+
+void transform_lio_world_point_to_map(const PointType & point_lio_world, PointType * point_map, const tf2::Transform & T_map_lio) {
+    const tf2::Vector3 p_map =
+        T_map_lio * tf2::Vector3(
+            point_lio_world.x,
+            point_lio_world.y,
+            point_lio_world.z);
+
+    point_map->x = p_map.x();
+    point_map->y = p_map.y();
+    point_map->z = p_map.z();
+    point_map->intensity = point_lio_world.intensity;
+}
+
+void set_pose_from_transform(geometry_msgs::msg::Pose & pose, const tf2::Transform & transform) {
+    pose.position.x = transform.getOrigin().x();
+    pose.position.y = transform.getOrigin().y();
+    pose.position.z = transform.getOrigin().z();
+    pose.orientation = tf2::toMsg(transform.getRotation());
+}
+
+tf2::Transform project_transform_to_se2(const tf2::Transform & transform) {
+    double roll = 0.0;
+    double pitch = 0.0;
+    double yaw = 0.0;
+
+    tf2::Matrix3x3(transform.getRotation()).getRPY(roll, pitch, yaw);
+
+    tf2::Quaternion q_2d;
+    q_2d.setRPY(0.0, 0.0, yaw);
+    q_2d.normalize();
+
+    tf2::Transform transform_2d;
+    transform_2d.setOrigin(tf2::Vector3(
+        transform.getOrigin().x(),
+        transform.getOrigin().y(),
+        0.0));
+    transform_2d.setRotation(q_2d);
+
+    return transform_2d;
+}
+
+void points_cache_collect() {
     PointVector points_history;
     ikdtree.acquire_removed_points(points_history);
     // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
@@ -237,8 +296,7 @@ void points_cache_collect()
 
 BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
-void lasermap_fov_segment()
-{
+void lasermap_fov_segment() {
     cub_needrm.clear();
     kdtree_delete_counter = 0;
     kdtree_delete_time = 0.0;    
@@ -486,23 +544,27 @@ void map_incremental() {
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull, const std::string & world_frame) {
-    if(scan_pub_en)
+void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull,  const std::string & world_frame, const tf2::Transform & T_map_lio) {
+    if (scan_pub_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
+
+        PointCloudXYZI::Ptr laserCloudMap(new PointCloudXYZI(size, 1));
 
         for (int i = 0; i < size; i++)
         {
-            RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                                &laserCloudWorld->points[i]);
+            PointType point_lio_world;
+            RGBpointBodyToWorld(&laserCloudFullRes->points[i], &point_lio_world);
+
+            transform_lio_world_point_to_map(
+                point_lio_world,
+                &laserCloudMap->points[i],
+                T_map_lio);
         }
 
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+        pcl::toROSMsg(*laserCloudMap, laserCloudmsg);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
         laserCloudmsg.header.frame_id = world_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
@@ -560,41 +622,50 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect, const std::string & world_frame) {
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(effct_feat_num, 1));
+void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect, const std::string & world_frame, const tf2::Transform & T_map_lio) {
+    PointCloudXYZI::Ptr laserCloudMap(new PointCloudXYZI(effct_feat_num, 1));
+
     for (int i = 0; i < effct_feat_num; i++)
     {
-        RGBpointBodyToWorld(&laserCloudOri->points[i], \
-                            &laserCloudWorld->points[i]);
+        PointType point_lio_world;
+        RGBpointBodyToWorld(&laserCloudOri->points[i], &point_lio_world);
+
+        transform_lio_world_point_to_map(
+            point_lio_world,
+            &laserCloudMap->points[i],
+            T_map_lio);
     }
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
-    pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
+    pcl::toROSMsg(*laserCloudMap, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
     laserCloudFullRes3.header.frame_id = world_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap, const std::string & world_frame) {
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap, const std::string & world_frame, const tf2::Transform & T_map_lio) {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
+
+    PointCloudXYZI::Ptr laserCloudMap(new PointCloudXYZI(size, 1));
 
     for (int i = 0; i < size; i++)
     {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
+        PointType point_lio_world;
+        RGBpointBodyToWorld(&laserCloudFullRes->points[i], &point_lio_world);
+
+        transform_lio_world_point_to_map(
+            point_lio_world,
+            &laserCloudMap->points[i],
+            T_map_lio);
     }
-    *pcl_wait_pub += *laserCloudWorld;
+
+    *pcl_wait_pub += *laserCloudMap;
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = world_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
-
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
     // pcl::toROSMsg(*featsFromMap, laserCloudMap);
     // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
@@ -626,23 +697,28 @@ void publish_odometry(
     std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
     const std::string & world_frame,
     const std::string & body_frame,
-    const bool publish_lio_tf) {
+    const bool publish_lio_tf,
+    const tf2::Transform & T_map_tracking)
+{
     odomAftMapped.header.frame_id = world_frame;
     odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+
+    set_pose_from_transform(odomAftMapped.pose.pose, T_map_tracking);
+
     auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
+    for (int i = 0; i < 6; i++)
     {
         int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+        odomAftMapped.pose.covariance[i * 6 + 0] = P(k, 3);
+        odomAftMapped.pose.covariance[i * 6 + 1] = P(k, 4);
+        odomAftMapped.pose.covariance[i * 6 + 2] = P(k, 5);
+        odomAftMapped.pose.covariance[i * 6 + 3] = P(k, 0);
+        odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
+        odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
     }
+
+    pubOdomAftMapped->publish(odomAftMapped);
 
     if (publish_lio_tf)
     {
@@ -650,27 +726,26 @@ void publish_odometry(
         trans.header.frame_id = world_frame;
         trans.header.stamp = odomAftMapped.header.stamp;
         trans.child_frame_id = body_frame;
-        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-        trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-        trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-        trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-        trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+        trans.transform.translation.x = T_map_tracking.getOrigin().x();
+        trans.transform.translation.y = T_map_tracking.getOrigin().y();
+        trans.transform.translation.z = T_map_tracking.getOrigin().z();
+        trans.transform.rotation = tf2::toMsg(T_map_tracking.getRotation());
         tf_br->sendTransform(trans);
     }
 }
 
-void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath, const std::string & world_frame) {
-    set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
+void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath, const std::string & world_frame, const tf2::Transform & T_map_tracking) {
+    set_pose_from_transform(msg_body_pose.pose, T_map_tracking);
+    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);
     msg_body_pose.header.frame_id = world_frame;
 
-    /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
     jjj++;
-    if (jjj % 10 == 0) 
+
+    if (jjj % 10 == 0)
     {
+        path.header.stamp = msg_body_pose.header.stamp;
+        path.header.frame_id = world_frame;
         path.poses.push_back(msg_body_pose);
         pubPath->publish(path);
     }
@@ -838,13 +913,13 @@ public:
         this->declare_parameter<bool>("rep105.enable", false);
         this->declare_parameter<bool>("rep105.publish_map_to_odom_tf", false);
         this->declare_parameter<bool>("rep105.publish_lio_tf", true);
-        this->declare_parameter<bool>("rep105.enable", false);
-        this->declare_parameter<bool>("rep105.align_map_to_odom_on_start", true);
         this->declare_parameter<std::string>("rep105.map_frame", "map");
         this->declare_parameter<std::string>("rep105.odom_frame", "odom");
         this->declare_parameter<std::string>("rep105.robot_tracking_frame", "mid360");
         this->declare_parameter<bool>("rep105.use_latest_robot_tf", true);
         this->declare_parameter<double>("rep105.tf_timeout_sec", 0.05);
+        this->declare_parameter<bool>("rep105.align_map_to_odom_on_start", true);
+        this->declare_parameter<bool>("rep105.project_map_to_2d", false);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
@@ -886,12 +961,13 @@ public:
         this->get_parameter_or<bool>("rep105.enable", rep105_enable_, false);
         this->get_parameter_or<bool>("rep105.publish_map_to_odom_tf", rep105_publish_map_to_odom_tf_, false);
         this->get_parameter_or<bool>("rep105.publish_lio_tf", rep105_publish_lio_tf_, true);
-        this->get_parameter_or<bool>("rep105.align_map_to_odom_on_start", rep105_align_map_to_odom_on_start_, true);
         this->get_parameter_or<std::string>("rep105.map_frame", rep105_map_frame_, "map");
         this->get_parameter_or<std::string>("rep105.odom_frame", rep105_odom_frame_, "odom");
         this->get_parameter_or<std::string>("rep105.robot_tracking_frame", rep105_robot_tracking_frame_, "mid360");
         this->get_parameter_or<bool>("rep105.use_latest_robot_tf", rep105_use_latest_robot_tf_, true);
         this->get_parameter_or<double>("rep105.tf_timeout_sec", rep105_tf_timeout_sec_, 0.05);
+        this->get_parameter_or<bool>("rep105.align_map_to_odom_on_start", rep105_align_map_to_odom_on_start_, true);
+        this->get_parameter_or<bool>("rep105.project_map_to_2d", rep105_project_map_to_2d_, false);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
@@ -899,6 +975,8 @@ public:
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id = lio_world_frame_;
+        T_map_lio_initial_.setIdentity();
+        latest_T_map_lio_.setIdentity();
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -982,6 +1060,99 @@ public:
     }
 
 private:
+
+    bool compute_map_alignment(tf2::Transform & T_map_lio, tf2::Transform & T_map_tracking, tf2::Transform & T_odom_tracking) {
+        const tf2::Transform T_lio_tracking = make_lio_tracking_transform();
+
+        if (!rep105_enable_ || !rep105_publish_map_to_odom_tf_)
+        {
+            T_map_lio.setIdentity();
+            T_map_tracking = T_lio_tracking;
+            T_odom_tracking.setIdentity();
+
+            latest_T_map_lio_ = T_map_lio;
+            latest_map_alignment_ready_ = true;
+
+            return true;
+        }
+
+        geometry_msgs::msg::TransformStamped odom_to_tracking_msg;
+
+        try {
+            if (rep105_use_latest_robot_tf_) {
+                odom_to_tracking_msg = tf_buffer_->lookupTransform(
+                    rep105_odom_frame_,
+                    rep105_robot_tracking_frame_,
+                    tf2::TimePointZero,
+                    tf2::durationFromSec(rep105_tf_timeout_sec_));
+            } else {
+                odom_to_tracking_msg = tf_buffer_->lookupTransform(
+                    rep105_odom_frame_,
+                    rep105_robot_tracking_frame_,
+                    get_ros_time(lidar_end_time),
+                    tf2::durationFromSec(rep105_tf_timeout_sec_));
+            }
+        } catch (const tf2::TransformException & ex) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "Cannot lookup TF %s -> %s: %s",
+                rep105_odom_frame_.c_str(),
+                rep105_robot_tracking_frame_.c_str(),
+                ex.what());
+            return false;
+        }
+
+        tf2::fromMsg(odom_to_tracking_msg.transform, T_odom_tracking);
+
+        if (!rep105_initial_alignment_ready_)
+        {
+            if (rep105_align_map_to_odom_on_start_)
+            {
+                T_map_lio_initial_ =
+                    T_odom_tracking * T_lio_tracking.inverse();
+            }
+            else
+            {
+                T_map_lio_initial_.setIdentity();
+            }
+
+            rep105_initial_alignment_ready_ = true;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "REP-105 initial alignment captured. align_map_to_odom_on_start=%s",
+                rep105_align_map_to_odom_on_start_ ? "true" : "false");
+        }
+
+        const tf2::Transform T_map_tracking_full =
+            T_map_lio_initial_ * T_lio_tracking;
+
+        tf2::Transform T_map_odom =
+            T_map_tracking_full * T_odom_tracking.inverse();
+
+        if (rep105_project_map_to_2d_)
+        {
+            T_map_odom = project_transform_to_se2(T_map_odom);
+
+            // Recompute the tracking pose so all published global outputs are
+            // consistent with the projected map -> odom TF.
+            T_map_tracking = T_map_odom * T_odom_tracking;
+            T_map_lio = T_map_tracking * T_lio_tracking.inverse();
+        }
+        else
+        {
+            T_map_tracking = T_map_tracking_full;
+            T_map_lio = T_map_lio_initial_;
+        }
+
+        latest_T_map_lio_ = T_map_lio;
+        latest_map_alignment_ready_ = true;
+
+        return true;
+    }
+
     void timer_callback() {
         if(sync_packages(Measures))
         {
@@ -1086,11 +1257,18 @@ private:
 
             double t_update_end = omp_get_wtime();
 
-            /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_, lio_world_frame_, lio_body_frame_, rep105_publish_lio_tf_);
+            /******* Compute REP-105 map alignment *******/
+            tf2::Transform T_map_lio;
+            tf2::Transform T_map_tracking;
+            tf2::Transform T_odom_tracking;
+
+            if (!compute_map_alignment(T_map_lio, T_map_tracking, T_odom_tracking)) return;
+
+            /******* Publish odometry in real map frame *******/
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_, lio_world_frame_, lio_body_frame_, rep105_publish_lio_tf_, T_map_tracking);
 
             /******* Publish REP-105 map -> odom *******/
-            publish_map_to_odom_tf();
+            publish_map_to_odom_tf(T_map_tracking, T_odom_tracking);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1098,11 +1276,12 @@ private:
             t5 = omp_get_wtime();
 
             /******* Publish points *******/
-            if (path_en) publish_path(pubPath_, lio_world_frame_);
-            if (scan_pub_en) publish_frame_world(pubLaserCloudFull_, lio_world_frame_);
-            if (scan_pub_en && scan_body_pub_en)  publish_frame_body(pubLaserCloudFull_body_, lio_body_frame_);
-            if (effect_pub_en)  publish_effect_world(pubLaserCloudEffect_, lio_world_frame_);
-            // if (map_pub_en) publish_map(pubLaserCloudMap_, lio_world_frame_);
+            if (path_en)  publish_path(pubPath_, lio_world_frame_, T_map_tracking);
+            if (scan_pub_en) publish_frame_world(pubLaserCloudFull_, lio_world_frame_, T_map_lio);
+            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_, lio_body_frame_);
+            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_, lio_world_frame_, T_map_lio);
+
+            // if (map_pub_en) publish_map(pubLaserCloudMap_, lio_world_frame_, T_map_lio);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1137,7 +1316,10 @@ private:
     }
 
     void map_publish_callback() {
-        if (map_pub_en) publish_map(pubLaserCloudMap_, lio_world_frame_);
+        if (!map_pub_en) return;
+        if (rep105_enable_ && rep105_publish_map_to_odom_tf_ && !latest_map_alignment_ready_) return;
+
+        publish_map(pubLaserCloudMap_, lio_world_frame_, latest_T_map_lio_);
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res) {
@@ -1155,56 +1337,10 @@ private:
         }
     }
 
-    void publish_map_to_odom_tf() {
+    void publish_map_to_odom_tf(const tf2::Transform & T_map_tracking, const tf2::Transform & T_odom_tracking) {
         if (!rep105_enable_ || !rep105_publish_map_to_odom_tf_) {
             return;
         }
-
-        geometry_msgs::msg::TransformStamped odom_to_tracking_msg;
-
-        try {
-            if (rep105_use_latest_robot_tf_) {
-                odom_to_tracking_msg = tf_buffer_->lookupTransform(
-                    rep105_odom_frame_,
-                    rep105_robot_tracking_frame_,
-                    tf2::TimePointZero,
-                    tf2::durationFromSec(rep105_tf_timeout_sec_));
-            } else {
-                odom_to_tracking_msg = tf_buffer_->lookupTransform(
-                    rep105_odom_frame_,
-                    rep105_robot_tracking_frame_,
-                    get_ros_time(lidar_end_time),
-                    tf2::durationFromSec(rep105_tf_timeout_sec_));
-            }
-        } catch (const tf2::TransformException & ex) {
-            RCLCPP_WARN_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                2000,
-                "Cannot lookup TF %s -> %s: %s",
-                rep105_odom_frame_.c_str(),
-                rep105_robot_tracking_frame_.c_str(),
-                ex.what());
-            return;
-        }
-
-        tf2::Transform T_map_tracking;
-        T_map_tracking.setOrigin(tf2::Vector3(
-            state_point.pos(0),
-            state_point.pos(1),
-            state_point.pos(2)));
-
-        tf2::Quaternion q_map_tracking(
-            state_point.rot.coeffs()[0],
-            state_point.rot.coeffs()[1],
-            state_point.rot.coeffs()[2],
-            state_point.rot.coeffs()[3]);
-        q_map_tracking.normalize();
-
-        T_map_tracking.setRotation(q_map_tracking);
-
-        tf2::Transform T_odom_tracking;
-        tf2::fromMsg(odom_to_tracking_msg.transform, T_odom_tracking);
 
         const tf2::Transform T_map_odom =
             T_map_tracking * T_odom_tracking.inverse();
@@ -1241,10 +1377,13 @@ private:
     bool rep105_publish_map_to_odom_tf_ = false;
     bool rep105_publish_lio_tf_ = true;
     bool rep105_use_latest_robot_tf_ = true;
-    double rep105_tf_timeout_sec_ = 0.05;
     bool rep105_align_map_to_odom_on_start_ = true;
+    bool rep105_project_map_to_2d_ = false;
     bool rep105_initial_alignment_ready_ = false;
+    bool latest_map_alignment_ready_ = false;
+    double rep105_tf_timeout_sec_ = 0.05;
     tf2::Transform T_map_lio_initial_;
+    tf2::Transform latest_T_map_lio_;
 
     std::string lio_world_frame_ = "camera_init";
     std::string lio_body_frame_ = "body";
