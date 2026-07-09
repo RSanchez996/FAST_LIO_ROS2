@@ -163,3 +163,33 @@
             # -1 significa "todo en un PCD" en la lógica original, pero puede reventar memoria.
             # Para áreas extensas, no confiaría en esto como sistema de submapas.
             interval: -1
+        
+        frames:
+            # Mundo interno de FAST-LIO. En modo REP-105 lo reinterpretamos como map.
+            lio_world_frame: "map"
+
+            # Body interno de FAST-LIO. Debe coincidir con el frame del MID360/IMU en tu URDF.
+            lio_body_frame: "mid360"
+
+        rep105:
+            # Activa cálculo interno de map -> odom.
+            enable: true
+
+            # Publica sólo map -> odom.
+            publish_map_to_odom_tf: true
+
+            # Muy importante: false para no publicar map -> mid360 directo.
+            # Si esto está true, mid360 tendría dos padres: map y base_link.
+            publish_lio_tf: false
+
+            map_frame: "map"
+            odom_frame: "odom"
+
+            # Debe existir en TF:
+            #   odom -> base_link -> mid360
+            robot_tracking_frame: "mid360"
+
+            # En robot real evita errores de extrapolación entre FAST-LIO y odom del Go2.
+            use_latest_robot_tf: true
+
+            tf_timeout_sec: 0.05
