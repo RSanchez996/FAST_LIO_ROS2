@@ -1,50 +1,165 @@
 /**:
     ros__parameters:
+
+        # false = usa FAST-LIO2 en modo directo sobre puntos crudos.
+        # true = intenta extraer features geométricas antes del registro.
+        # Para MID360 y navegación exterior, normalmente false es correcto.
         feature_extract_enable: false
+
+        # Submuestreo básico de puntos de entrada.
+        # 3 = se queda aproximadamente con 1 de cada 3 puntos válidos.
+        # Más alto reduce CPU, pero también reduce detalle geométrico.
         point_filter_num: 3
+
+        # Número máximo de iteraciones del filtro/optimización por scan.
+        # Más iteraciones pueden mejorar convergencia, pero suben CPU.
         max_iteration: 3
+
+        # Voxel size para reducir la nube del scan actual antes de usarla.
+        # Afecta a la densidad de puntos usados para odometría.
+        # Menor = más detalle y más coste.
+        # Mayor = menos puntos, más rápido, menos preciso en geometría fina.
         filter_size_surf: 0.5
+
+        # Voxel size usado para insertar/mantener puntos en el mapa interno.
+        # Afecta al ikd-Tree interno de FAST-LIO.
+        # Para exterior en Jetson, 0.5-0.8 suele ser más razonable que valores muy bajos.
         filter_size_map: 0.5
+
+        # Tamaño del cubo local de mapa usado internamente por FAST-LIO.
+        # No es el tamaño de /Laser_map.
+        # Controla la ventana local del ikd-Tree para odometría.
+        # 1000.0 es grande para exteriores amplios en Jetson.
+        # Para primeras pruebas exteriores usaría 200.0-300.0.
         cube_side_length: 1000.0
+
+        # Activa logs internos de tiempo/posición.
+        # Para navegación real conviene false para no meter E/S innecesaria.
         runtime_pos_log_enable: false
+
+        # Ruta donde se guardará el PCD cuando llames al servicio /map_save.
+        # No significa que vaya guardando automáticamente cada cierto tiempo.
+        # Conviene usar una ruta absoluta.
         map_file_path: "./test.pcd"
 
         common:
-            lid_topic:  "/livox/lidar"
-            imu_topic:  "/livox/imu"
-            time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
-            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
-                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+            # Topic de entrada LiDAR.
+            # Con lidar_type: 1 debe ser livox_ros_driver2/msg/CustomMsg.
+            # FAST-LIO para Livox necesita CustomMsg porque contiene offset_time por punto.
+            lid_topic: "/livox/lidar"
+
+            # Topic de entrada IMU.
+            imu_topic: "/livox/imu"
+
+            # false = asume que LiDAR e IMU ya vienen bien sincronizados.
+            # true = aplica sincronización software simple.
+            # El README recomienda usarlo solo si no hay sincronización externa real.
+            time_sync_en: false
+
+            # Offset temporal LiDAR -> IMU.
+            # Déjalo a 0.0 si no lo has calibrado explícitamente.
+            # Si lo ajustas mal, empeora el deskew y la odometría.
+            time_offset_lidar_to_imu: 0.0
 
         preprocess:
-            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
-            scan_line:  4
+            # 1 = Livox serial LiDAR usando CustomMsg.
+            # Con este valor, el código se suscribe a livox_ros_driver2/msg/CustomMsg.
+            # Si /livox/lidar está en PointCloud2, esta configuración no corresponde.
+            lidar_type: 1
+
+            # Número de líneas/canales del MID360.
+            # Para MID360 se suele usar 4.
+            scan_line: 4
+
+            # Radio ciego mínimo.
+            # Descarta puntos demasiado cerca del LiDAR.
+            # Útil para eliminar cuerpo del robot/ruido cercano.
             blind: 0.5
+
+            # Unidad del timestamp para rutas PointCloud2.
+            # En la ruta Livox CustomMsg, el handler usa offset_time y lo pasa a ms.
+            # Por tanto, aquí no es el parámetro crítico si lidar_type = 1.
             timestamp_unit: 3
+
+            # Frecuencia nominal del LiDAR en Hz.
+            # Para MID360 normalmente 10 Hz.
             scan_rate: 10
 
         mapping:
+            # Covarianza de acelerómetro usada por el filtro.
+            # Más alto = menos confianza en aceleración IMU.
             acc_cov: 0.1
+
+            # Covarianza de giróscopo usada por el filtro.
+            # Más alto = menos confianza en gyro.
             gyr_cov: 0.1
+
+            # Ruido del bias del acelerómetro.
             b_acc_cov: 0.0001
+
+            # Ruido del bias del giróscopo.
             b_gyr_cov: 0.0001
-            fov_degree:    360.0
-            det_range:     100.0
-            extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
+
+            # FOV declarado.
+            # Ojo: el código interno limita el FOV usado en segmentación local.
+            # Poner 360.0 no significa necesariamente publicar/usar un mapa global 360 completo.
+            fov_degree: 360.0
+
+            # Rango máximo usado para detección/mapping.
+            # Más rango = más puntos y más coste.
+            # En exterior puedes probar 80.0-100.0, pero para Jetson empezaría por 80.0.
+            det_range: 100.0
+
+            # true = estima extrínseca LiDAR-IMU online.
+            # false = usa extrinsic_T y extrinsic_R fijas.
+            # Si ya conoces la extrínseca MID360/IMU, recomiendo false.
+            extrinsic_est_en: true
+
+            # Traslación del LiDAR respecto al frame IMU/body usado por FAST-LIO.
+            # Debe coincidir con la convención del repo:
+            # pose del LiDAR en el frame IMU/body.
             extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+
+            # Rotación LiDAR -> IMU/body como matriz 3x3 en row-major.
+            # Identidad solo es correcta si los ejes LiDAR e IMU coinciden.
             extrinsic_R: [ 1., 0., 0.,
-                            0., 1., 0.,
-                            0., 0., 1.]
+                           0., 1., 0.,
+                           0., 0., 1. ]
 
         publish:
-            path_en: true                # true: publish Path
+            # Publica nav_msgs/Path.
+            # Solo visualización. Para navegación exterior y Jetson, mejor false.
+            path_en: false                # true: publish Path
+
+            # Publica nube de puntos efectivos usados en la actualización.
+            # No es un mapa navegable.
+            # Normalmente false.
             effect_map_en: false         # true: publish Effects
-            map_en: true                 # true: publish Map cloud
+
+            # Activa publicación del mapa acumulado interno en /Laser_map.
+            # Cuidado: en este repo /Laser_map acumula en memoria, no hace decay.
+            # Útil para debug/guardado, no ideal para navegación online directa.
+            map_en: false                 # true: publish Map cloud
+
+            # Activa publicación de nubes procesadas.
+            # Si está false, no salen las nubes de scan registrado/body.
             scan_publish_en:  true       # false: close all the point cloud output
+
+            # false = publica nube reducida/downsampled.
+            # true = publica nube densa.
+            # Para navegación y Jetson, false.
             dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+
+            # Activa publicación de la nube deskewed en body/IMU.
+            # Es la salida que te interesa para convertir a LaserScan o alimentar navegación local.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
         pcd_save:
+            # Habilita que el servicio /map_save pueda guardar el mapa.
+            # No implica guardado periódico automático limpio.
             pcd_save_en: true
-            interval: -1                 # how many LiDAR frames saved in each pcd file; 
-                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+
+            # En este repo, el guardado periódico por intervalos está en una sección comentada.
+            # -1 significa "todo en un PCD" en la lógica original, pero puede reventar memoria.
+            # Para áreas extensas, no confiaría en esto como sistema de submapas.
+            interval: -1
