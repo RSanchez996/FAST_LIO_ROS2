@@ -9,7 +9,7 @@
         # Submuestreo básico de puntos de entrada.
         # 3 = se queda aproximadamente con 1 de cada 3 puntos válidos.
         # Más alto reduce CPU, pero también reduce detalle geométrico.
-        point_filter_num: 3
+        point_filter_num: 2
 
         # Número máximo de iteraciones del filtro/optimización por scan.
         # Más iteraciones pueden mejorar convergencia, pero suben CPU.
@@ -31,7 +31,7 @@
         # Controla la ventana local del ikd-Tree para odometría.
         # 1000.0 es grande para exteriores amplios en Jetson.
         # Para primeras pruebas exteriores usaría 200.0-300.0.
-        cube_side_length: 1000.0
+        cube_side_length: 200.0
 
         # Activa logs internos de tiempo/posición.
         # Para navegación real conviene false para no meter E/S innecesaria.
@@ -113,18 +113,29 @@
             # true = estima extrínseca LiDAR-IMU online.
             # false = usa extrinsic_T y extrinsic_R fijas.
             # Si ya conoces la extrínseca MID360/IMU, recomiendo false.
-            extrinsic_est_en: true
+            extrinsic_est_en: false
 
             # Traslación del LiDAR respecto al frame IMU/body usado por FAST-LIO.
             # Debe coincidir con la convención del repo:
             # pose del LiDAR en el frame IMU/body.
-            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            #extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_T: [-0.011, -0.0234, 0.044] # [-0.003408589, -0.026032029, 0.051348206]
 
             # Rotación LiDAR -> IMU/body como matriz 3x3 en row-major.
             # Identidad solo es correcta si los ejes LiDAR e IMU coinciden.
-            extrinsic_R: [ 1., 0., 0.,
-                           0., 1., 0.,
-                           0., 0., 1. ]
+            # extrinsic_R: [ 1., 0., 0.,
+            #                0., 1., 0.,
+            #                0., 0., 1. ]
+            extrinsic_R: [ 0.9999161,  0.0026676,  0.0126707,
+                          -0.0025826,  0.9999741, -0.0067201,
+                          -0.0126883,  0.0066868,  0.9998971 ]
+
+            
+                        #  [ 0.999930042, -0.011718805, 0.001606515,
+                        #    0.011707079,  0.999906094, 0.007123711,
+                        #   -0.001689846, -0.007104405, 0.999973336]
+
+  
 
         publish:
             # Publica nav_msgs/Path.
