@@ -9,7 +9,7 @@
         # Submuestreo básico de puntos de entrada.
         # 3 = se queda aproximadamente con 1 de cada 3 puntos válidos.
         # Más alto reduce CPU, pero también reduce detalle geométrico.
-        point_filter_num: 2
+        point_filter_num: 1
 
         # Número máximo de iteraciones del filtro/optimización por scan.
         # Más iteraciones pueden mejorar convergencia, pero suben CPU.
@@ -31,7 +31,7 @@
         # Controla la ventana local del ikd-Tree para odometría.
         # 1000.0 es grande para exteriores amplios en Jetson.
         # Para primeras pruebas exteriores usaría 200.0-300.0.
-        cube_side_length: 200.0
+        cube_side_length: 500.0
 
         # Activa logs internos de tiempo/posición.
         # Para navegación real conviene false para no meter E/S innecesaria.
@@ -41,6 +41,33 @@
         # No significa que vaya guardando automáticamente cada cierto tiempo.
         # Conviene usar una ruta absoluta.
         map_file_path: "./test.pcd"
+
+        processing:
+            # Hilos utilizados dentro del bucle OpenMP de correspondencias.
+            # Empezar con 2 en Jetson AGX Orin.
+            openmp_threads: 2
+
+            # Hilos del executor ROS 2:
+            # mapping, LiDAR e IMU podrán progresar concurrentemente.
+            executor_threads: 3
+
+            # Profundidad máxima de cola para nubes Livox.
+            lidar_qos_depth: 50
+
+            # Profundidad máxima de cola de IMU.
+            # A 200 Hz representa hasta 2 segundos de margen máximo.
+            imu_qos_depth: 400
+            queue_stats_enabled: false
+            queue_stats_period_sec: 1.0
+
+            # Con un LiDAR a 20 Hz, una cola de 3 scans ya representa
+            # aproximadamente 150 ms de acumulación.
+            lidar_queue_warn_size: 3
+
+            # Con una IMU a 200 Hz, 100 mensajes representan
+            # aproximadamente 0,5 segundos de acumulación.
+            # 40 mensajes son 0,2 segundos de acumulación
+            imu_queue_warn_size: 40
 
         common:
             # Topic de entrada LiDAR.
@@ -83,7 +110,7 @@
 
             # Frecuencia nominal del LiDAR en Hz.
             # Para MID360 normalmente 10 Hz.
-            scan_rate: 10
+            scan_rate: 20
 
         mapping:
             # Covarianza de acelerómetro usada por el filtro.
@@ -156,14 +183,15 @@
             # Si está false, no salen las nubes de scan registrado/body.
             scan_publish_en:  true       # false: close all the point cloud output
 
-            # false = publica nube reducida/downsampled.
-            # true = publica nube densa.
-            # Para navegación y Jetson, false.
-            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            # No publicar /cloud_registered en map.
+            # Para nvblox no es necesario y ahorra ancho de banda.
+            scan_worldframe_pub_en: false
 
-            # Activa publicación de la nube deskewed en body/IMU.
-            # Es la salida que te interesa para convertir a LaserScan o alimentar navegación local.
-            scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+            # Publicar únicamente la nube deskewed en el frame físico del LiDAR.
+            scan_lidarframe_pub_en: true
+
+            # Solo afecta a la nube global si scan_worldframe_pub_en=true.
+            dense_publish_en: false
 
         pcd_save:
             # Habilita que el servicio /map_save pueda guardar el mapa.
