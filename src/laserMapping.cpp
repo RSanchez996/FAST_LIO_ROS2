@@ -89,7 +89,7 @@ int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delet
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 /**************************/
 
-float res_last[100000] = {0.0};
+std::vector<float> res_last;
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
@@ -109,7 +109,7 @@ int effct_feat_num = 0, time_log_counter = 0, scan_count = 0;
 // de correspondencias punto-mapa.
 int openmp_threads = 2;
 int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
-bool point_selected_surf[100000] = {0};
+std::vector<std::uint8_t> point_selected_surf;
 bool lidar_pushed = false, flg_first_scan = true, flg_EKF_inited = false;
 bool scan_pub_en = false;
 bool dense_pub_en = false;
@@ -719,18 +719,52 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 void publish_frame_lidar(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & publisher, const std::string & lidar_frame) {
   if (publisher == nullptr || feats_undistort == nullptr || feats_undistort->empty()) return;
 
+  const std::size_t number_of_points = feats_undistort->points.size();
+
+  if (number_of_points > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("fastlio_mapping"),
+      "Cannot publish LiDAR cloud: too many points: %zu",
+      number_of_points);
+
+    return;
+  }
+
+  // La nube Livox es no organizada.
+  feats_undistort->width = static_cast<std::uint32_t>(number_of_points);
+
+  feats_undistort->height = 1U;
+  feats_undistort->is_dense = false;
+
   sensor_msgs::msg::PointCloud2 message;
 
-  // feats_undistort ya está deskewed por FAST-LIO y permanece
-  // expresada en el frame físico del LiDAR.
-  //
-  // No debe volver a transformarse al frame IMU antes de
-  // alimentar el modelo LiDAR de nvblox.
   pcl::toROSMsg(*feats_undistort, message);
 
   message.header.stamp = get_ros_time(lidar_end_time);
 
   message.header.frame_id = lidar_frame;
+
+  const std::size_t expected_data_size = static_cast<std::size_t>(message.row_step) * static_cast<std::size_t>(message.height);
+
+  if (
+    message.point_step == 0U ||
+    message.row_step < message.width * message.point_step ||
+    message.data.size() < expected_data_size)
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("fastlio_mapping"),
+      "Generated invalid PointCloud2: width=%u "
+      "height=%u point_step=%u row_step=%u "
+      "data_size=%zu expected=%zu",
+      message.width,
+      message.height,
+      message.point_step,
+      message.row_step,
+      message.data.size(),
+      expected_data_size);
+
+    return;
+  }
 
   publisher->publish(message);
 }
@@ -866,8 +900,6 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath, con
 
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data) {
     double match_start = omp_get_wtime();
-    laserCloudOri->clear(); 
-    corr_normvect->clear(); 
     total_residual = 0.0; 
 
     /** closest surface search and residual computation **/
@@ -1201,12 +1233,8 @@ public:
 
         _featsArray.reset(new PointCloudXYZI());
 
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
 
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
@@ -1517,6 +1545,13 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+            const std::size_t feature_count = static_cast<std::size_t>(feats_down_size);
+            normvec->resize(feature_count);
+            feats_down_world->resize(feature_count);
+            laserCloudOri->resize(feature_count);
+            corr_normvect->resize(feature_count);
+            res_last.assign(feature_count,0.0F);
+            point_selected_surf.assign(feature_count,1U);
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
