@@ -217,6 +217,10 @@
             # Body interno de FAST-LIO. Debe coincidir con el frame del MID360/IMU en tu URDF.
             lio_body_frame: "mid360"
 
+            # Frame físico de las coordenadas de la nube deskewed.
+            # Debe coincidir con robot_state_publisher: base_link -> livox_frame.
+            lidar_frame: "livox_frame"
+
         rep105:
             # Activa cálculo interno de map -> odom.
             enable: true
