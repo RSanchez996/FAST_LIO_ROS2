@@ -1069,10 +1069,12 @@ public:
         this->declare_parameter<int>("processing.executor_threads", 3);
         this->declare_parameter<int>("processing.lidar_qos_depth", 50);
         this->declare_parameter<int>("processing.imu_qos_depth", 400);
+        this->declare_parameter<bool>("processing.deskew_only", false);
         this->declare_parameter<bool>("processing.queue_stats_enabled", true);
         this->declare_parameter<double>("processing.queue_stats_period_sec", 1.0);
         this->declare_parameter<int>("processing.lidar_queue_warn_size", 3);
         this->declare_parameter<int>("processing.imu_queue_warn_size", 100);
+        this->declare_parameter<std::string>("publish.deskewed_topic", "/cloud_registered_lidar");
 
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
@@ -1128,10 +1130,35 @@ public:
         this->get_parameter_or<int>("processing.executor_threads", executor_threads_, 3);
         this->get_parameter_or<int>("processing.lidar_qos_depth", lidar_qos_depth_, 50);
         this->get_parameter_or<int>("processing.imu_qos_depth", imu_qos_depth_, 400);
+        this->get_parameter_or<bool>("processing.deskew_only", deskew_only_, false);
         this->get_parameter_or<bool>("processing.queue_stats_enabled", queue_stats_enabled_, true);
         this->get_parameter_or<double>("processing.queue_stats_period_sec", queue_stats_period_sec_, 1.0);
         this->get_parameter_or<int>("processing.lidar_queue_warn_size", lidar_queue_warn_size_, 3);
         this->get_parameter_or<int>("processing.imu_queue_warn_size", imu_queue_warn_size_, 100);
+        this->get_parameter_or<std::string>("publish.deskewed_topic", deskewed_topic_, "/cloud_registered_lidar");
+
+        if (deskew_only_)
+        {
+            // Keep synchronization, IMU initialization/prediction and point
+            // motion compensation, but disable the LiDAR scan-to-map backend.
+            path_en = false;
+            effect_pub_en = false;
+            map_pub_en = false;
+            scan_world_pub_en = false;
+            scan_lidar_pub_en = true;
+            rep105_enable_ = false;
+            rep105_publish_map_to_odom_tf_ = false;
+            rep105_publish_lio_tf_ = false;
+            pcd_save_en = false;
+
+            RCLCPP_WARN(
+                this->get_logger(),
+                "FAST-LIO deskew-only mode enabled. Publishing only '%s' in frame '%s'. "
+                "LiDAR scan-to-map updates, map construction, odometry, path and TF are disabled. "
+                "The deskew trajectory is IMU-predicted and is not corrected by LiDAR registration.",
+                deskewed_topic_.c_str(),
+                lio_body_frame_.c_str());
+        }
 
         
 
@@ -1297,7 +1324,7 @@ public:
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, imu_cbk, imu_options);
 
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
-        pubLaserCloudFull_lidar_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_lidar", rclcpp::SensorDataQoS());
+        pubLaserCloudFull_lidar_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(deskewed_topic_, rclcpp::SensorDataQoS());
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
@@ -1309,15 +1336,32 @@ public:
         //------------------------------------------------------------------------------------------------------
         const auto mapping_period = std::chrono::milliseconds(10);
         timer_ = this->create_wall_timer(mapping_period, std::bind(&LaserMappingNode::timer_callback, this), mapping_callback_group_);
-        const auto map_publish_period = std::chrono::seconds(1);
-        map_pub_timer_ = this->create_wall_timer(map_publish_period, std::bind(&LaserMappingNode::map_publish_callback, this), mapping_callback_group_);
+        if (!deskew_only_)
+        {
+            const auto map_publish_period = std::chrono::seconds(1);
+            map_pub_timer_ = this->create_wall_timer(
+                map_publish_period,
+                std::bind(&LaserMappingNode::map_publish_callback, this),
+                mapping_callback_group_);
+        }
         if (queue_stats_enabled_)
         {
             const auto queue_stats_period = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(queue_stats_period_sec_));
             previous_queue_stats_time_ = std::chrono::steady_clock::now();
             queue_stats_timer_ = this->create_wall_timer(queue_stats_period, std::bind(&LaserMappingNode::queue_stats_callback, this), mapping_callback_group_);
         }
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), mapping_callback_group_);
+        if (!deskew_only_)
+        {
+            map_save_srv_ = this->create_service<std_srvs::srv::Trigger>(
+                "map_save",
+                std::bind(
+                    &LaserMappingNode::map_save_callback,
+                    this,
+                    std::placeholders::_1,
+                    std::placeholders::_2),
+                rclcpp::ServicesQoS(),
+                mapping_callback_group_);
+        }
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
@@ -1457,6 +1501,13 @@ private:
 
             if (!feats_undistort || feats_undistort->empty()) {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                return;
+            }
+
+            if (deskew_only_)
+            {
+                publish_frame_lidar(pubLaserCloudFull_lidar_, lio_body_frame_);
+                mapping_completed_count.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
@@ -1835,6 +1886,7 @@ private:
     int lidar_qos_depth_ = 50;
     int imu_qos_depth_ = 400;
 
+    bool deskew_only_ = false;
     bool queue_stats_enabled_ = true;
     double queue_stats_period_sec_ = 1.0;
 
@@ -1882,6 +1934,7 @@ private:
 
     std::string lio_world_frame_ = "camera_init";
     std::string lio_body_frame_ = "body";
+    std::string deskewed_topic_ = "/cloud_registered_lidar";
 
     std::string rep105_map_frame_ = "map";
     std::string rep105_odom_frame_ = "odom";

@@ -45,7 +45,7 @@
         processing:
             # false: full FAST-LIO2 odometry and mapping.
             # true: synchronize LiDAR/IMU, deskew and publish only.
-            deskew_only: false
+            deskew_only: true
 
             # Hilos utilizados dentro del bucle OpenMP de correspondencias.
             # Empezar con 2 en Jetson AGX Orin.
@@ -170,7 +170,7 @@
 
         publish:
             # PointCloud2 output after motion compensation.
-            deskewed_topic: "/cloud_registered_lidar"
+            deskewed_topic: "/cloud_deskewed"
 
             # Publica nav_msgs/Path.
             # Solo visualización. Para navegación exterior y Jetson, mejor false.
@@ -203,7 +203,7 @@
         pcd_save:
             # Habilita que el servicio /map_save pueda guardar el mapa.
             # No implica guardado periódico automático limpio.
-            pcd_save_en: true
+            pcd_save_en: false
 
             # En este repo, el guardado periódico por intervalos está en una sección comentada.
             # -1 significa "todo en un PCD" en la lógica original, pero puede reventar memoria.
@@ -219,10 +219,10 @@
 
         rep105:
             # Activa cálculo interno de map -> odom.
-            enable: true
+            enable: false
 
             # Publica sólo map -> odom.
-            publish_map_to_odom_tf: true
+            publish_map_to_odom_tf: false
 
             # Muy importante: false para no publicar map -> mid360 directo.
             # Si esto está true, mid360 tendría dos padres: map y base_link.
