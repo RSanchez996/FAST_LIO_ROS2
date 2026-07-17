@@ -1052,6 +1052,7 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<std::string>("frames.lio_world_frame", "map");
         this->declare_parameter<std::string>("frames.lio_body_frame", "body");
+        this->declare_parameter<std::string>("frames.lidar_frame", "livox_frame");
         this->declare_parameter<bool>("rep105.enable", false);
         this->declare_parameter<bool>("rep105.publish_map_to_odom_tf", false);
         this->declare_parameter<bool>("rep105.publish_lio_tf", true);
@@ -1113,6 +1114,7 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<std::string>("frames.lio_world_frame", lio_world_frame_, "map");
         this->get_parameter_or<std::string>("frames.lio_body_frame", lio_body_frame_, "body");
+        this->get_parameter_or<std::string>("frames.lidar_frame", lidar_frame_, "livox_frame");
         this->get_parameter_or<bool>("rep105.enable", rep105_enable_, false);
         this->get_parameter_or<bool>("rep105.publish_map_to_odom_tf", rep105_publish_map_to_odom_tf_, false);
         this->get_parameter_or<bool>("rep105.publish_lio_tf", rep105_publish_lio_tf_, true);
@@ -1157,7 +1159,7 @@ public:
                 "LiDAR scan-to-map updates, map construction, odometry, path and TF are disabled. "
                 "The deskew trajectory is IMU-predicted and is not corrected by LiDAR registration.",
                 deskewed_topic_.c_str(),
-                lio_body_frame_.c_str());
+                lidar_frame_.c_str());
         }
 
         
@@ -1506,7 +1508,7 @@ private:
 
             if (deskew_only_)
             {
-                publish_frame_lidar(pubLaserCloudFull_lidar_, lio_body_frame_);
+                publish_frame_lidar(pubLaserCloudFull_lidar_, lidar_frame_);
                 mapping_completed_count.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -1635,7 +1637,7 @@ private:
             /******* Publish points *******/
             if (path_en)  publish_path(pubPath_, lio_world_frame_, T_map_tracking);
             if (scan_pub_en && scan_world_pub_en) publish_frame_world(pubLaserCloudFull_, lio_world_frame_, T_map_lio);
-            if (scan_pub_en && scan_lidar_pub_en) publish_frame_lidar(pubLaserCloudFull_lidar_, lio_body_frame_);
+            if (scan_pub_en && scan_lidar_pub_en) publish_frame_lidar(pubLaserCloudFull_lidar_, lidar_frame_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_, lio_world_frame_, T_map_lio);
 
             // if (map_pub_en) publish_map(pubLaserCloudMap_, lio_world_frame_, T_map_lio);
@@ -1934,6 +1936,7 @@ private:
 
     std::string lio_world_frame_ = "camera_init";
     std::string lio_body_frame_ = "body";
+    std::string lidar_frame_ = "livox_frame";
     std::string deskewed_topic_ = "/cloud_registered_lidar";
 
     std::string rep105_map_frame_ = "map";
