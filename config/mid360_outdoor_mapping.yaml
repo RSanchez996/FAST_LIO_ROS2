@@ -1,0 +1,186 @@
+/**:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # FAST-LIO2: registro y mapa local usado por la odometria
+    # -------------------------------------------------------------------------
+
+    # MID360 funciona correctamente en FAST-LIO2 sin extraccion clasica de
+    # aristas/planos. Activarla aumenta el coste y no suele aportar estabilidad.
+    feature_extract_enable: false
+
+    # Conserva todos los puntos Livox validos antes del voxelizado de FAST-LIO.
+    # Para bajar CPU, usar 2; para el mapa mas detallado, mantener 1.
+    point_filter_num: 1
+
+    # Iteraciones maximas de la actualizacion iterativa LiDAR-inercial.
+    # Tres suele ser un equilibrio razonable en una Jetson AGX Orin.
+    max_iteration: 3
+
+    # Voxel del scan utilizado por la odometria scan-to-map.
+    # No determina la resolucion del PCD/PLY final: esa se controla con
+    # pcd_save.voxel_size.
+    filter_size_surf: 0.30
+
+    # Resolucion de insercion en el ikd-Tree local de FAST-LIO.
+    # 0.30 m conserva suficiente geometria exterior sin disparar el coste.
+    filter_size_map: 0.30
+
+    # Ventana cubica LOCAL del ikd-Tree. No necesita cubrir el kilometro entero:
+    # FAST-LIO desplaza esta ventana conforme avanza el robot.
+    # Debe ser estrictamente mayor que 3 * mapping.det_range.
+    cube_side_length: 400.0
+
+    runtime_pos_log_enable: false
+
+    # El launch sobrescribe esta ruta. La extension selecciona el formato:
+    #   .pcd -> PCD binario
+    #   .ply -> PLY binario
+    map_file_path: "~/AutonomousNavigation/maps/fast_lio/map.ply"
+
+    processing:
+      deskew_only: false
+
+      # Correspondencias punto-mapa. Subir a 6-8 solo si el profiling demuestra
+      # que FAST-LIO mantiene margen termico y no crecen las colas.
+      openmp_threads: 4
+
+      # Callbacks LiDAR, IMU y mapping pueden progresar concurrentemente.
+      executor_threads: 3
+
+      lidar_qos_depth: 50
+      imu_qos_depth: 400
+
+      queue_stats_enabled: true
+      queue_stats_period_sec: 2.0
+      lidar_queue_warn_size: 3
+      imu_queue_warn_size: 40
+
+    common:
+      # Con preprocess.lidar_type=1, este topic debe ser
+      # livox_ros_driver2/msg/CustomMsg para conservar offset_time por punto.
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+
+      # Mantener false si LiDAR e IMU comparten una base temporal coherente.
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+
+    preprocess:
+      # AVIA/Livox CustomMsg en este fork.
+      lidar_type: 1
+      scan_line: 4
+
+      # Elimina retornos del propio robot y ruido muy proximo al MID360.
+      blind: 0.50
+
+      # No es critico para CustomMsg, que usa offset_time por punto.
+      timestamp_unit: 3
+
+      # Valor nominal conservador. En CustomMsg no se utiliza para construir el
+      # tiempo de cada punto, pero se deja coherente con el MID360.
+      scan_rate: 10
+
+    mapping:
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+
+      fov_degree: 360.0
+
+      # Rango de registro. Para un mapa de gran extension no hay que aumentar
+      # este valor hasta 1 km: el mapa crece por movimiento del robot.
+      # 80 m evita incorporar demasiados retornos lejanos y ruidosos.
+      det_range: 80.0
+
+      # Usa la calibracion fija LiDAR-IMU ya obtenida.
+      extrinsic_est_en: false
+      extrinsic_T: [-0.011, -0.0234, 0.044]
+      extrinsic_R: [0.9999161,  0.0026676,  0.0126707,
+                   -0.0025826,  0.9999741, -0.0067201,
+                   -0.0126883,  0.0066868,  0.9998971]
+
+    publish:
+      deskewed_topic: "/cloud_registered_lidar"
+
+      path_en: false
+      effect_map_en: false
+
+      # IMPORTANTE: el guardado ya no depende de /Laser_map. Mantener false
+      # evita republicar una nube global cada segundo y reduce mucho el consumo.
+      map_en: false
+
+      scan_publish_en: true
+
+      # Publica el scan registrado y voxelizado en map para RViz/diagnostico.
+      scan_worldframe_pub_en: true
+
+      # No se necesita la nube adicional en el frame fisico del LiDAR durante
+      # este launch de mapeo exclusivamente con FAST-LIO.
+      scan_lidarframe_pub_en: false
+
+      # false publica feats_down_body en /cloud_registered. El mapa guardado
+      # puede seguir usando la nube densa mediante pcd_save.use_dense_cloud.
+      dense_publish_en: false
+
+    pcd_save:
+      # Habilita /map_save y la acumulacion global independiente de /Laser_map.
+      pcd_save_en: true
+
+      # Conservado por compatibilidad con el YAML anterior. En la nueva
+      # implementacion no se usa para trocear scans.
+      interval: -1
+
+      # Al pulsar Ctrl+C se escribe el mapa final si hay cambios pendientes.
+      # Tambien puede guardarse manualmente mediante /map_save.
+      save_on_shutdown: true
+
+      # Resolucion del PCD/PLY final. Para recorridos exteriores largos:
+      #   0.10 m -> mas detalle, bastante mas RAM y disco
+      #   0.15 m -> valor recomendado de partida
+      #   0.20-0.25 m -> campañas muy largas o memoria limitada
+      voxel_size: 0.15
+
+      # Integra uno de cada N scans en el mapa exportable. Con 1 se aprovecha
+      # toda la densidad; usar 2 si el acumulador compite con el registro.
+      scan_stride: 1
+
+      # true integra feats_undistort; false integra la nube reducida usada por
+      # la odometria. Para obtener el mapa mas detallado, usar true.
+      use_dense_cloud: true
+
+      # Limite de seguridad para evitar agotar RAM. Al alcanzarlo se actualizan
+      # voxeles ya existentes, pero no se abren voxeles de zonas nuevas.
+      # 0 desactiva el limite, lo cual no se recomienda en la Jetson.
+      max_voxels: 20000000
+
+      # Reserva inicial del hash para reducir realojos; no crea puntos.
+      reserve_voxels: 2000000
+
+      # Rango de los puntos que se incorporan al fichero final.
+      min_range: 0.50
+      max_range: 80.0
+
+    frames:
+      lio_world_frame: "map"
+      lio_body_frame: "mid360"
+
+    rep105:
+      enable: true
+      publish_map_to_odom_tf: true
+
+      # Evita un segundo padre TF para mid360. El Go2 conserva
+      # odom -> base_link -> mid360.
+      publish_lio_tf: false
+
+      map_frame: "map"
+      odom_frame: "odom"
+      robot_tracking_frame: "mid360"
+
+      use_latest_robot_tf: true
+      tf_timeout_sec: 0.05
+
+      # Hace coincidir map y odom al inicio sin perder roll/pitch/z del mapa 3D.
+      align_map_to_odom_on_start: true
+      project_map_to_2d: false

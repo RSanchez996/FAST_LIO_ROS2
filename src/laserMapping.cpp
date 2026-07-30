@@ -38,6 +38,7 @@
 #include <thread>
 #include <fstream>
 #include <chrono>
+#include <cctype>
 #include <unistd.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
@@ -51,6 +52,7 @@
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/io/ply_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -70,8 +72,11 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #include <rclcpp/executors/multi_threaded_executor.hpp>
@@ -1013,6 +1018,42 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+
+struct SavedMapVoxelKey {
+    std::int64_t x;
+    std::int64_t y;
+    std::int64_t z;
+
+    bool operator==(const SavedMapVoxelKey & other) const noexcept
+    {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct SavedMapVoxelKeyHash {
+    std::size_t operator()(const SavedMapVoxelKey & key) const noexcept
+    {
+        std::size_t seed = 0U;
+        const auto combine = [&seed](const std::int64_t value) {
+            const std::size_t hashed = std::hash<std::int64_t>{}(value);
+            seed ^= hashed + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+        };
+
+        combine(key.x);
+        combine(key.y);
+        combine(key.z);
+        return seed;
+    }
+};
+
+struct SavedMapVoxelAccumulator {
+    double x_sum = 0.0;
+    double y_sum = 0.0;
+    double z_sum = 0.0;
+    double intensity_sum = 0.0;
+    std::uint64_t count = 0U;
+};
+
 class LaserMappingNode : public rclcpp::Node {
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options) {
@@ -1050,6 +1091,14 @@ public:
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
+        this->declare_parameter<bool>("pcd_save.save_on_shutdown", true);
+        this->declare_parameter<double>("pcd_save.voxel_size", 0.15);
+        this->declare_parameter<int>("pcd_save.scan_stride", 1);
+        this->declare_parameter<bool>("pcd_save.use_dense_cloud", true);
+        this->declare_parameter<std::int64_t>("pcd_save.max_voxels", 20000000);
+        this->declare_parameter<std::int64_t>("pcd_save.reserve_voxels", 1000000);
+        this->declare_parameter<double>("pcd_save.min_range", 0.5);
+        this->declare_parameter<double>("pcd_save.max_range", 80.0);
         this->declare_parameter<std::string>("frames.lio_world_frame", "map");
         this->declare_parameter<std::string>("frames.lio_body_frame", "body");
         this->declare_parameter<bool>("rep105.enable", false);
@@ -1111,6 +1160,14 @@ public:
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
+        this->get_parameter_or<bool>("pcd_save.save_on_shutdown", pcd_save_on_shutdown_, true);
+        this->get_parameter_or<double>("pcd_save.voxel_size", pcd_save_voxel_size_, 0.15);
+        this->get_parameter_or<int>("pcd_save.scan_stride", pcd_save_scan_stride_, 1);
+        this->get_parameter_or<bool>("pcd_save.use_dense_cloud", pcd_save_use_dense_cloud_, true);
+        this->get_parameter_or<std::int64_t>("pcd_save.max_voxels", pcd_save_max_voxels_, 20000000);
+        this->get_parameter_or<std::int64_t>("pcd_save.reserve_voxels", pcd_save_reserve_voxels_, 1000000);
+        this->get_parameter_or<double>("pcd_save.min_range", pcd_save_min_range_, 0.5);
+        this->get_parameter_or<double>("pcd_save.max_range", pcd_save_max_range_, 80.0);
         this->get_parameter_or<std::string>("frames.lio_world_frame", lio_world_frame_, "map");
         this->get_parameter_or<std::string>("frames.lio_body_frame", lio_body_frame_, "body");
         this->get_parameter_or<bool>("rep105.enable", rep105_enable_, false);
@@ -1188,6 +1245,34 @@ public:
             throw std::invalid_argument("filter_size_surf and filter_size_map must be > 0");
         }
 
+        if (pcd_save_en)
+        {
+            if (map_file_path.empty()) {
+                throw std::invalid_argument("map_file_path must not be empty when pcd_save.pcd_save_en is true");
+            }
+
+            if (pcd_save_voxel_size_ <= 0.0) {
+                throw std::invalid_argument("pcd_save.voxel_size must be > 0");
+            }
+
+            if (pcd_save_scan_stride_ < 1) {
+                throw std::invalid_argument("pcd_save.scan_stride must be >= 1");
+            }
+
+            if (pcd_save_max_voxels_ < 0 || pcd_save_reserve_voxels_ < 0) {
+                throw std::invalid_argument("pcd_save.max_voxels and pcd_save.reserve_voxels must be >= 0");
+            }
+
+            if (pcd_save_min_range_ < 0.0 || pcd_save_max_range_ <= pcd_save_min_range_) {
+                throw std::invalid_argument("pcd_save range must satisfy 0 <= min_range < max_range");
+            }
+
+            if (pcd_save_reserve_voxels_ > 0)
+            {
+                saved_map_voxels_.reserve(static_cast<std::size_t>(pcd_save_reserve_voxels_));
+            }
+        }
+
         const double minimum_cube_side = 2.0 * MOV_THRESHOLD * static_cast<double>(DET_RANGE);
         if (cube_len <= minimum_cube_side)
         {
@@ -1231,6 +1316,21 @@ public:
             queue_stats_period_sec_,
             lidar_queue_warn_size_,
             imu_queue_warn_size_);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Map saving: enabled=%s, path='%s', save_on_shutdown=%s, "
+            "voxel_size=%.3f m, scan_stride=%d, dense=%s, "
+            "range=[%.1f, %.1f] m, max_voxels=%ld",
+            pcd_save_en ? "true" : "false",
+            map_file_path.c_str(),
+            pcd_save_on_shutdown_ ? "true" : "false",
+            pcd_save_voxel_size_,
+            pcd_save_scan_stride_,
+            pcd_save_use_dense_cloud_ ? "true" : "false",
+            pcd_save_min_range_,
+            pcd_save_max_range_,
+            static_cast<long>(pcd_save_max_voxels_));
 
         #ifdef MP_EN
         RCLCPP_INFO(
@@ -1366,6 +1466,22 @@ public:
     }
 
     ~LaserMappingNode() override {
+        if (pcd_save_en && pcd_save_on_shutdown_ && saved_map_dirty_)
+        {
+            std::string save_message;
+            if (!save_accumulated_map(save_message))
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Automatic map save failed during shutdown: %s",
+                    save_message.c_str());
+            }
+            else
+            {
+                RCLCPP_INFO(this->get_logger(), "%s", save_message.c_str());
+            }
+        }
+
         if (fout_out.is_open()) fout_out.close();
         if (fout_pre.is_open()) fout_pre.close();
         if (fout_dbg.is_open()) fout_dbg.close();
@@ -1632,6 +1748,9 @@ private:
             map_incremental();
             t5 = omp_get_wtime();
 
+            /******* Accumulate a bounded-density global map for PCD/PLY export *******/
+            accumulate_map_for_save(T_map_lio);
+
             /******* Publish points *******/
             if (path_en)  publish_path(pubPath_, lio_world_frame_, T_map_tracking);
             if (scan_pub_en && scan_world_pub_en) publish_frame_world(pubLaserCloudFull_, lio_world_frame_, T_map_lio);
@@ -1701,18 +1820,226 @@ private:
         publish_map(pubLaserCloudMap_, lio_world_frame_, latest_T_map_lio_);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res) {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
+    void accumulate_map_for_save(const tf2::Transform & T_map_lio) {
+        if (!pcd_save_en) return;
+    
+
+        ++pcd_save_seen_scans_;
+        if (((pcd_save_seen_scans_ - 1U) % static_cast<std::uint64_t>(pcd_save_scan_stride_)) != 0U) return;
+    
+
+        const PointCloudXYZI::Ptr source_cloud =
+            pcd_save_use_dense_cloud_ ? feats_undistort : feats_down_body;
+
+        if (source_cloud == nullptr || source_cloud->empty()) return;
+
+        const double minimum_range_squared = pcd_save_min_range_ * pcd_save_min_range_;
+        const double maximum_range_squared = pcd_save_max_range_ * pcd_save_max_range_;
+        bool reached_capacity = false;
+
+        for (const PointType & source_point : source_cloud->points)
         {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
+            const double range_squared = static_cast<double>(source_point.x) * source_point.x + static_cast<double>(source_point.y) * source_point.y + static_cast<double>(source_point.z) * source_point.z;
+
+            if (
+                !std::isfinite(range_squared) ||
+                range_squared < minimum_range_squared ||
+                range_squared > maximum_range_squared)
+            {
+                continue;
+            }
+
+            PointType point_lio_world;
+            PointType point_map;
+            RGBpointBodyToWorld(&source_point, &point_lio_world);
+            transform_lio_world_point_to_map(point_lio_world, &point_map, T_map_lio);
+
+            if (!std::isfinite(point_map.x) || !std::isfinite(point_map.y) || !std::isfinite(point_map.z) || !std::isfinite(point_map.intensity)) {
+                continue;
+            }
+
+            const SavedMapVoxelKey key{
+                static_cast<std::int64_t>(std::floor(point_map.x / pcd_save_voxel_size_)),
+                static_cast<std::int64_t>(std::floor(point_map.y / pcd_save_voxel_size_)),
+                static_cast<std::int64_t>(std::floor(point_map.z / pcd_save_voxel_size_))};
+
+            auto voxel = saved_map_voxels_.find(key);
+            if (voxel == saved_map_voxels_.end())
+            {
+                if (
+                    pcd_save_max_voxels_ > 0 && saved_map_voxels_.size() >= static_cast<std::size_t>(pcd_save_max_voxels_))
+                {
+                    reached_capacity = true;
+                    continue;
+                }
+
+                voxel = saved_map_voxels_.emplace(key, SavedMapVoxelAccumulator{}).first;
+            }
+
+            SavedMapVoxelAccumulator & accumulator = voxel->second;
+            accumulator.x_sum += point_map.x;
+            accumulator.y_sum += point_map.y;
+            accumulator.z_sum += point_map.z;
+            accumulator.intensity_sum += point_map.intensity;
+            ++accumulator.count;
+            ++pcd_save_accepted_points_;
+        }
+
+        if (!saved_map_voxels_.empty()) saved_map_dirty_ = true;
+        
+
+        if (reached_capacity)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                10000,
+                "Saved-map voxel limit reached (%zu). Existing voxels continue to be "
+                "updated, but new areas are no longer added. Increase "
+                "pcd_save.max_voxels or pcd_save.voxel_size.",
+                saved_map_voxels_.size());
+        }
+    }
+
+    bool save_accumulated_map(std::string & message)
+    {
+        if (!pcd_save_en)
+        {
+            message = "Map save disabled by pcd_save.pcd_save_en.";
+            return false;
+        }
+
+        if (saved_map_voxels_.empty())
+        {
+            message = "No accumulated map points are available yet.";
+            return false;
+        }
+
+        namespace fs = std::filesystem;
+        const fs::path output_path(map_file_path);
+        std::string extension = output_path.extension().string();
+        std::transform(
+            extension.begin(),
+            extension.end(),
+            extension.begin(),
+            [](const unsigned char value) {
+                return static_cast<char>(std::tolower(value));
+            });
+
+        if (extension != ".pcd" && extension != ".ply")
+        {
+            message = "map_file_path must end in .pcd or .ply.";
+            return false;
+        }
+
+        std::error_code directory_error;
+        if (!output_path.parent_path().empty()) {
+            fs::create_directories(output_path.parent_path(), directory_error);
+        }
+
+        if (directory_error)
+        {
+            message = "Cannot create map output directory: " + directory_error.message();
+            return false;
+        }
+
+        pcl::PointCloud<pcl::PointXYZI> output_cloud;
+        output_cloud.points.reserve(saved_map_voxels_.size());
+
+        for (const auto & entry : saved_map_voxels_)
+        {
+            const SavedMapVoxelAccumulator & accumulator = entry.second;
+            if (accumulator.count == 0U) continue;
+            
+
+            const double inverse_count = 1.0 / static_cast<double>(accumulator.count);
+
+            pcl::PointXYZI point;
+            point.x = static_cast<float>(accumulator.x_sum * inverse_count);
+            point.y = static_cast<float>(accumulator.y_sum * inverse_count);
+            point.z = static_cast<float>(accumulator.z_sum * inverse_count);
+            point.intensity = static_cast<float>(accumulator.intensity_sum * inverse_count);
+            output_cloud.points.push_back(point);
+        }
+
+        output_cloud.width = static_cast<std::uint32_t>(output_cloud.points.size());
+        output_cloud.height = 1U;
+        output_cloud.is_dense = false;
+
+        fs::path temporary_path = output_path;
+        temporary_path += ".tmp";
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Writing %zu voxelized points to %s...",
+            output_cloud.points.size(),
+            output_path.string().c_str());
+
+        int result = -1;
+        if (extension == ".pcd")
+        {
+            result = pcl::io::savePCDFileBinary(
+                temporary_path.string(),
+                output_cloud);
         }
         else
         {
-            res->success = false;
-            res->message = "Map save disabled.";
+            result = pcl::io::savePLYFileBinary(
+                temporary_path.string(),
+                output_cloud);
+        }
+
+        if (result != 0)
+        {
+            message =
+                "PCL failed to write the map to " + output_path.string() + ".";
+            return false;
+        }
+
+        std::error_code rename_error;
+        fs::rename(temporary_path, output_path, rename_error);
+        if (rename_error)
+        {
+            std::error_code remove_error;
+            fs::remove(output_path, remove_error);
+            rename_error.clear();
+            fs::rename(temporary_path, output_path, rename_error);
+        }
+
+        if (rename_error)
+        {
+            std::error_code cleanup_error;
+            fs::remove(temporary_path, cleanup_error);
+            message =
+                "Map data was written, but the temporary file could not be moved "
+                "to the final path: " + rename_error.message();
+            return false;
+        }
+
+        saved_map_dirty_ = false;
+        message =
+            "Map saved to " + output_path.string() + " with " +
+            std::to_string(output_cloud.points.size()) +
+            " voxelized points from " +
+            std::to_string(pcd_save_accepted_points_) +
+            " accepted observations.";
+        return true;
+    }
+
+    void map_save_callback(
+        std_srvs::srv::Trigger::Request::ConstSharedPtr request,
+        std_srvs::srv::Trigger::Response::SharedPtr response)
+    {
+        static_cast<void>(request);
+        response->success = save_accumulated_map(response->message);
+
+        if (response->success)
+        {
+            RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+        }
+        else
+        {
+            RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
         }
     }
 
@@ -1919,6 +2246,22 @@ private:
     rclcpp::TimerBase::SharedPtr queue_stats_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
+    std::unordered_map<
+        SavedMapVoxelKey,
+        SavedMapVoxelAccumulator,
+        SavedMapVoxelKeyHash> saved_map_voxels_;
+    bool pcd_save_on_shutdown_ = true;
+    bool pcd_save_use_dense_cloud_ = true;
+    bool saved_map_dirty_ = false;
+    double pcd_save_voxel_size_ = 0.15;
+    double pcd_save_min_range_ = 0.5;
+    double pcd_save_max_range_ = 80.0;
+    int pcd_save_scan_stride_ = 1;
+    std::int64_t pcd_save_max_voxels_ = 20000000;
+    std::int64_t pcd_save_reserve_voxels_ = 1000000;
+    std::uint64_t pcd_save_seen_scans_ = 0U;
+    std::uint64_t pcd_save_accepted_points_ = 0U;
+
     bool effect_pub_en = false, map_pub_en = false;
     bool rep105_enable_ = false;
     bool rep105_publish_map_to_odom_tf_ = false;
@@ -1966,18 +2309,6 @@ int main(int argc, char** argv)
 
     if (rclcpp::ok())
         rclcpp::shutdown();
-    /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
-    {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-    }
-
     if (runtime_pos_log)
     {
         vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    

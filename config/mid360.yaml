@@ -244,4 +244,4 @@
             align_map_to_odom_on_start: true
             # true = map -> odom sólo tendrá x, y, yaw.
             # Recomendado para Nav2 2D.
-            project_map_to_2d: true
+            project_map_to_2d: false

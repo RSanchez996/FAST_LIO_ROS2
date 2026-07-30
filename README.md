@@ -139,23 +139,41 @@ Edit ``` config/avia.yaml ``` to set the below parameters:
 - The extrinsic parameters in FAST-LIO is defined as the LiDAR's pose (position and rotation matrix) in IMU body frame (i.e. the IMU is the base frame). They can be found in the official manual.
 - FAST-LIO produces a very simple software time sync for livox LiDAR, set parameter ```time_sync_en``` to ture to turn on. But turn on **ONLY IF external time synchronization is really not possible**, since the software time sync cannot make sure accuracy.
 
-### 3.4 PCD file save
+### 3.4 PCD/PLY map save
 
-1. Enable `pcd_save.pcd_save_en` in the config file and set the `map_file_path` to the path where the map will be saved.
-2. Launch the fastlio2 according to README.
-3. Open RQt and switch to `Plugins->Services->Service Caller`. Trigger the service `/map_save`, then the pcd map file will be generated
+This fork contains a voxelized global-map accumulator intended for long outdoor
+runs. It is independent of `publish.map_en`, so `/Laser_map` can remain disabled
+without producing an empty save file or publishing an ever-growing cloud.
 
-```pcl_viewer scans.pcd``` can visualize the point clouds.
+1. Enable `pcd_save.pcd_save_en`.
+2. Set `map_file_path` to a path ending in `.pcd` or `.ply`.
+3. Select the exported resolution with `pcd_save.voxel_size`.
+4. Launch FAST-LIO in full mapping mode (`processing.deskew_only: false`).
+5. Save manually, preferably after stopping the robot:
 
-*Tips for pcl_viewer:*
-- change what to visualize/color by pressing keyboard 1,2,3,4,5 when pcl_viewer is running. 
+```bash
+ros2 service call /map_save std_srvs/srv/Trigger "{}"
 ```
-    1 is all random
-    2 is X values
-    3 is Y values
-    4 is Z values
-    5 is intensity
-```
+
+When `pcd_save.save_on_shutdown` is true, pending map changes are also written
+when the node exits normally after Ctrl+C.
+
+Relevant parameters:
+
+- `pcd_save.voxel_size`: one centroid point is retained per 3D voxel.
+- `pcd_save.scan_stride`: integrates one out of every N registered scans.
+- `pcd_save.use_dense_cloud`: uses the complete deskewed scan instead of the
+  scan voxelized for odometry.
+- `pcd_save.min_range` / `max_range`: accepted LiDAR range in the saved map.
+- `pcd_save.max_voxels`: memory safety limit; `0` removes the limit.
+- `pcd_save.reserve_voxels`: initial hash reservation to reduce reallocations.
+
+The map is written in the REP-105 `map` frame and contains `x`, `y`, `z` and
+`intensity`. For long outdoor routes, start with a 0.15 m output voxel. A 0.10 m
+voxel provides more detail but can require substantially more RAM and disk.
+
+`publish.map_en` is only for `/Laser_map` visualization and is not required for
+saving. Keep it disabled during large-area mapping.
 
 ## 4. Rosbag Example
 ### 4.1 Livox Avia Rosbag
