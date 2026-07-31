@@ -175,6 +175,66 @@ voxel provides more detail but can require substantially more RAM and disk.
 `publish.map_en` is only for `/Laser_map` visualization and is not required for
 saving. Keep it disabled during large-area mapping.
 
+### 3.5 Temporal observation export for dynamic-object cleaning
+
+The compact PCD/PLY intentionally merges every observation that falls in the
+same global voxel. That representation is useful for visualization and surface
+reconstruction, but it cannot distinguish a static wall from the trail left by
+a moving person or vehicle.
+
+Enable the independent temporal export with:
+
+```yaml
+pcd_save:
+  temporal_export:
+    enabled: true
+    output_dir: ""
+    scans_per_chunk: 200
+    max_pending_chunks: 2
+    scan_stride: 1
+    point_stride: 1
+    use_dense_cloud: true
+    write_trajectory_knots: true
+```
+
+When `output_dir` is empty, FAST-LIO derives a directory from
+`map_file_path`, for example:
+
+```text
+fast_lio_outdoor_20260731_120000.ply
+fast_lio_outdoor_20260731_120000_temporal/
+```
+
+If the directory already contains data, a numeric suffix is added instead of
+overwriting or mixing sessions.
+
+The directory contains:
+
+- `observations_XXXXXX.pcd`: binary PCD chunks with `x`, `y`, `z`,
+  `intensity`, `time_offset_sec`, `scan_id` and `timestamp_sec`.
+- `scans.csv`: absolute scan interval, accepted point count and start/end
+  LiDAR pose for each exported scan.
+- `trajectory.csv`: intra-scan LiDAR trajectory knots. The IMU-predicted
+  trajectory is rigidly corrected so its final knot exactly matches the
+  post-EKF FAST-LIO state.
+- `chunks.csv`: chunk-to-scan manifest.
+- `metadata.yaml`: frame, field types and time semantics.
+
+Each observation point is already expressed in the final global map frame.
+To recover its ray origin, select the rows in `trajectory.csv` with the same
+`scan_id` and interpolate at `time_offset_sec`. This preserves the information
+needed for hit/free-space consistency tests and offline removal of moving
+object trails.
+
+The writer runs in a dedicated thread. `max_pending_chunks` bounds memory. If
+the disk becomes slower than acquisition, FAST-LIO applies backpressure at a
+chunk boundary rather than dropping temporal observations silently. Use a fast
+SSD and keep `scan_stride=1`, `point_stride=1` for the first cleaning tests.
+
+Calling `/map_save` flushes both the compact map and all pending temporal
+chunks. Temporal data are also flushed during a normal Ctrl+C shutdown whenever
+the temporal export is enabled.
+
 ## 4. Rosbag Example
 ### 4.1 Livox Avia Rosbag
 <div align="left">

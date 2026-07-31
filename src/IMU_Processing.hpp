@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cmath>
 #include <math.h>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include <fstream>
 #include <csignal>
 #include <so3_math.h>
@@ -33,6 +35,18 @@ class ImuProcess
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  struct TimedLidarPose
+  {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    double offset_time_sec = 0.0;
+    M3D rotation_lio_lidar = M3D::Identity();
+    V3D position_lio_lidar = V3D::Zero();
+  };
+
+  using TimedLidarPoseVector =
+    std::vector<TimedLidarPose, Eigen::aligned_allocator<TimedLidarPose>>;
+
   ImuProcess();
   ~ImuProcess();
   
@@ -46,6 +60,8 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  TimedLidarPoseVector corrected_lidar_trajectory(
+    const state_ikfom & corrected_end_state) const;
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -67,6 +83,7 @@ class ImuProcess
   sensor_msgs::msg::Imu::ConstSharedPtr last_imu_;
   deque<sensor_msgs::msg::Imu::ConstSharedPtr> v_imu_;
   vector<Pose6D> IMUpose;
+  vector<Pose6D> export_pose_knots_;
   vector<M3D>    v_rot_pcl_;
   M3D Lidar_R_wrt_IMU;
   V3D Lidar_T_wrt_IMU;
@@ -111,6 +128,7 @@ void ImuProcess::Reset()
   init_iter_num     = 1;
   v_imu_.clear();
   IMUpose.clear();
+  export_pose_knots_.clear();
   last_imu_.reset(new sensor_msgs::msg::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
@@ -298,6 +316,31 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
+  // Keep a copy of the IMU-predicted trajectory exclusively for offline
+  // temporal-map export. The deskew loop below continues to use IMUpose
+  // unchanged, so adding the exact scan-end knot cannot alter FAST-LIO's
+  // motion compensation behaviour.
+  export_pose_knots_ = IMUpose;
+  const double scan_end_offset_sec = std::max(0.0, pcl_end_time - pcl_beg_time);
+  const Pose6D scan_end_pose = set_pose6d(
+    scan_end_offset_sec,
+    acc_s_last,
+    angvel_last,
+    imu_state.vel,
+    imu_state.pos,
+    imu_state.rot.toRotationMatrix());
+
+  if (
+    export_pose_knots_.empty() ||
+    std::abs(export_pose_knots_.back().offset_time - scan_end_offset_sec) > 1.0e-6)
+  {
+    export_pose_knots_.push_back(scan_end_pose);
+  }
+  else
+  {
+    export_pose_knots_.back() = scan_end_pose;
+  }
+
   /*** undistort each lidar point (backward propagation) ***/
   if (pcl_out.points.begin() == pcl_out.points.end()) return;
   auto it_pcl = pcl_out.points.end() - 1;
@@ -334,6 +377,63 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       if (it_pcl == pcl_out.points.begin()) break;
     }
   }
+}
+
+ImuProcess::TimedLidarPoseVector ImuProcess::corrected_lidar_trajectory(
+  const state_ikfom & corrected_end_state) const
+{
+  TimedLidarPoseVector output;
+  if (export_pose_knots_.empty())
+  {
+    return output;
+  }
+
+  const Pose6D & predicted_end_pose = export_pose_knots_.back();
+
+  M3D predicted_end_rotation;
+  predicted_end_rotation << MAT_FROM_ARRAY(predicted_end_pose.rot);
+  const V3D predicted_end_position(VEC_FROM_ARRAY(predicted_end_pose.pos));
+
+  const M3D corrected_end_rotation =
+    corrected_end_state.rot.toRotationMatrix();
+  const V3D corrected_end_position = corrected_end_state.pos;
+
+  // The deskew trajectory is generated before the LiDAR measurement update.
+  // Apply one rigid left correction to every knot so the final predicted IMU
+  // pose coincides exactly with the post-update FAST-LIO state while retaining
+  // the intra-scan motion estimated from the IMU.
+  const M3D correction_rotation =
+    corrected_end_rotation * predicted_end_rotation.transpose();
+  const V3D correction_translation =
+    corrected_end_position - correction_rotation * predicted_end_position;
+
+  const M3D rotation_imu_lidar =
+    corrected_end_state.offset_R_L_I.toRotationMatrix();
+  const V3D translation_imu_lidar = corrected_end_state.offset_T_L_I;
+
+  output.reserve(export_pose_knots_.size());
+  for (const Pose6D & pose : export_pose_knots_)
+  {
+    M3D predicted_rotation;
+    predicted_rotation << MAT_FROM_ARRAY(pose.rot);
+    const V3D predicted_position(VEC_FROM_ARRAY(pose.pos));
+
+    const M3D corrected_rotation_imu =
+      correction_rotation * predicted_rotation;
+    const V3D corrected_position_imu =
+      correction_rotation * predicted_position + correction_translation;
+
+    TimedLidarPose lidar_pose;
+    lidar_pose.offset_time_sec = std::max(0.0, pose.offset_time);
+    lidar_pose.rotation_lio_lidar =
+      corrected_rotation_imu * rotation_imu_lidar;
+    lidar_pose.position_lio_lidar =
+      corrected_position_imu +
+      corrected_rotation_imu * translation_imu_lidar;
+    output.push_back(lidar_pose);
+  }
+
+  return output;
 }
 
 void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr cur_pcl_un_)

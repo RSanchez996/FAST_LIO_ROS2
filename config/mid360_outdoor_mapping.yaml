@@ -36,7 +36,7 @@
     # El launch sobrescribe esta ruta. La extension selecciona el formato:
     #   .pcd -> PCD binario
     #   .ply -> PLY binario
-    map_file_path: "~/AutonomousNavigation/maps/fast_lio/map.ply"
+    map_file_path: "/tmp/fast_lio_outdoor_map.pcd"
 
     processing:
       deskew_only: false
@@ -140,7 +140,7 @@
       #   0.10 m -> mas detalle, bastante mas RAM y disco
       #   0.15 m -> valor recomendado de partida
       #   0.20-0.25 m -> campañas muy largas o memoria limitada
-      voxel_size: 0.15
+      voxel_size: 0.1
 
       # Integra uno de cada N scans en el mapa exportable. Con 1 se aprovecha
       # toda la densidad; usar 2 si el acumulador compite con el registro.
@@ -161,6 +161,42 @@
       # Rango de los puntos que se incorporan al fichero final.
       min_range: 0.50
       max_range: 80.0
+
+      # Exportacion adicional para limpiar obstaculos dinamicos offline.
+      # No sustituye al PCD/PLY compacto anterior: conserva las observaciones
+      # separadas por scan y la trayectoria necesaria para hacer raycasting.
+      temporal_export:
+        enabled: true
+
+        # Vacio deriva automaticamente un directorio junto al mapa principal:
+        #   <map_file_path_sin_extension>_temporal
+        # Si ya existe, se crea un sufijo _001, _002, etc. para no mezclar
+        # sesiones ni sobrescribir datos anteriores.
+        output_dir: ""
+
+        # Cada chunk se escribe como observations_XXXXXX.pcd binario con:
+        # x, y, z, intensity, time_offset_sec, scan_id y timestamp_sec.
+        # 200 scans suele equilibrar RAM, numero de ficheros y coste de E/S.
+        scans_per_chunk: 200
+
+        # Numero maximo de chunks esperando al hilo de escritura. Si el disco
+        # no mantiene el ritmo, FAST-LIO aplica backpressure para no perder
+        # observaciones silenciosamente.
+        max_pending_chunks: 2
+
+        # Conserva uno de cada N scans y uno de cada N puntos del scan elegido.
+        # Para una limpieza temporal fiable deben permanecer en 1 inicialmente.
+        scan_stride: 1
+        point_stride: 1
+
+        # true usa feats_undistort, igual que el mapa detallado. false usa la
+        # nube voxelizada de la odometria y reduce mucho el volumen de datos.
+        use_dense_cloud: true
+
+        # trajectory.csv guarda los nudos IMU/LiDAR de cada scan. La trayectoria
+        # predicha por IMU se corrige rigidamente para terminar exactamente en
+        # la pose posterior a la actualizacion LiDAR del EKF.
+        write_trajectory_knots: true
 
     frames:
       lio_world_frame: "map"

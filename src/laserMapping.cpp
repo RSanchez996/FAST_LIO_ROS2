@@ -39,10 +39,12 @@
 #include <fstream>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <unistd.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -70,16 +72,50 @@
 #include <ikd-Tree/ikd_Tree.h>
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <rclcpp/executors/multi_threaded_executor.hpp>
+
+struct TemporalObservationPoint
+{
+    float x;
+    float y;
+    float z;
+    float intensity;
+    float time_offset_sec;
+    std::uint32_t scan_id;
+    double timestamp_sec;
+};
+
+static_assert(
+    std::is_standard_layout<TemporalObservationPoint>::value,
+    "TemporalObservationPoint must remain a standard-layout binary record");
+static_assert(
+    std::is_trivially_copyable<TemporalObservationPoint>::value,
+    "TemporalObservationPoint must remain trivially copyable");
+static_assert(offsetof(TemporalObservationPoint, x) == 0U);
+static_assert(offsetof(TemporalObservationPoint, y) == 4U);
+static_assert(offsetof(TemporalObservationPoint, z) == 8U);
+static_assert(offsetof(TemporalObservationPoint, intensity) == 12U);
+static_assert(offsetof(TemporalObservationPoint, time_offset_sec) == 16U);
+static_assert(offsetof(TemporalObservationPoint, scan_id) == 20U);
+static_assert(offsetof(TemporalObservationPoint, timestamp_sec) == 24U);
+static_assert(
+    sizeof(TemporalObservationPoint) == 32U,
+    "TemporalObservationPoint PCD record must remain exactly 32 bytes");
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -310,6 +346,26 @@ void transform_lio_world_point_to_map(const PointType & point_lio_world, PointTy
     point_map->y = p_map.y();
     point_map->z = p_map.z();
     point_map->intensity = point_lio_world.intensity;
+}
+
+tf2::Transform make_transform_from_eigen(
+    const M3D & rotation,
+    const V3D & translation)
+{
+    Eigen::Quaterniond eigen_quaternion(rotation);
+    eigen_quaternion.normalize();
+
+    tf2::Transform transform;
+    transform.setOrigin(tf2::Vector3(
+        translation.x(),
+        translation.y(),
+        translation.z()));
+    transform.setRotation(tf2::Quaternion(
+        eigen_quaternion.x(),
+        eigen_quaternion.y(),
+        eigen_quaternion.z(),
+        eigen_quaternion.w()));
+    return transform;
 }
 
 void set_pose_from_transform(geometry_msgs::msg::Pose & pose, const tf2::Transform & transform) {
@@ -1019,7 +1075,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 }
 
 
-struct SavedMapVoxelKey {
+struct SavedMapVoxelKey
+{
     std::int64_t x;
     std::int64_t y;
     std::int64_t z;
@@ -1030,7 +1087,8 @@ struct SavedMapVoxelKey {
     }
 };
 
-struct SavedMapVoxelKeyHash {
+struct SavedMapVoxelKeyHash
+{
     std::size_t operator()(const SavedMapVoxelKey & key) const noexcept
     {
         std::size_t seed = 0U;
@@ -1046,12 +1104,24 @@ struct SavedMapVoxelKeyHash {
     }
 };
 
-struct SavedMapVoxelAccumulator {
+struct SavedMapVoxelAccumulator
+{
     double x_sum = 0.0;
     double y_sum = 0.0;
     double z_sum = 0.0;
     double intensity_sum = 0.0;
     std::uint64_t count = 0U;
+};
+
+struct TemporalExportChunk
+{
+    std::uint64_t chunk_index = 0U;
+    std::uint64_t first_scan_id = 0U;
+    std::uint64_t last_scan_id = 0U;
+    std::uint64_t scan_count = 0U;
+    std::vector<TemporalObservationPoint> points;
+    std::vector<std::string> scan_rows;
+    std::vector<std::string> trajectory_rows;
 };
 
 class LaserMappingNode : public rclcpp::Node {
@@ -1099,6 +1169,14 @@ public:
         this->declare_parameter<std::int64_t>("pcd_save.reserve_voxels", 1000000);
         this->declare_parameter<double>("pcd_save.min_range", 0.5);
         this->declare_parameter<double>("pcd_save.max_range", 80.0);
+        this->declare_parameter<bool>("pcd_save.temporal_export.enabled", false);
+        this->declare_parameter<std::string>("pcd_save.temporal_export.output_dir", "");
+        this->declare_parameter<int>("pcd_save.temporal_export.scans_per_chunk", 200);
+        this->declare_parameter<int>("pcd_save.temporal_export.max_pending_chunks", 2);
+        this->declare_parameter<int>("pcd_save.temporal_export.scan_stride", 1);
+        this->declare_parameter<int>("pcd_save.temporal_export.point_stride", 1);
+        this->declare_parameter<bool>("pcd_save.temporal_export.use_dense_cloud", true);
+        this->declare_parameter<bool>("pcd_save.temporal_export.write_trajectory_knots", true);
         this->declare_parameter<std::string>("frames.lio_world_frame", "map");
         this->declare_parameter<std::string>("frames.lio_body_frame", "body");
         this->declare_parameter<bool>("rep105.enable", false);
@@ -1168,6 +1246,14 @@ public:
         this->get_parameter_or<std::int64_t>("pcd_save.reserve_voxels", pcd_save_reserve_voxels_, 1000000);
         this->get_parameter_or<double>("pcd_save.min_range", pcd_save_min_range_, 0.5);
         this->get_parameter_or<double>("pcd_save.max_range", pcd_save_max_range_, 80.0);
+        this->get_parameter_or<bool>("pcd_save.temporal_export.enabled", temporal_export_enabled_, false);
+        this->get_parameter_or<std::string>("pcd_save.temporal_export.output_dir", temporal_output_dir_, "");
+        this->get_parameter_or<int>("pcd_save.temporal_export.scans_per_chunk", temporal_scans_per_chunk_, 200);
+        this->get_parameter_or<int>("pcd_save.temporal_export.max_pending_chunks", temporal_max_pending_chunks_, 2);
+        this->get_parameter_or<int>("pcd_save.temporal_export.scan_stride", temporal_scan_stride_, 1);
+        this->get_parameter_or<int>("pcd_save.temporal_export.point_stride", temporal_point_stride_, 1);
+        this->get_parameter_or<bool>("pcd_save.temporal_export.use_dense_cloud", temporal_use_dense_cloud_, true);
+        this->get_parameter_or<bool>("pcd_save.temporal_export.write_trajectory_knots", temporal_write_trajectory_knots_, true);
         this->get_parameter_or<std::string>("frames.lio_world_frame", lio_world_frame_, "map");
         this->get_parameter_or<std::string>("frames.lio_body_frame", lio_body_frame_, "body");
         this->get_parameter_or<bool>("rep105.enable", rep105_enable_, false);
@@ -1207,6 +1293,7 @@ public:
             rep105_publish_map_to_odom_tf_ = false;
             rep105_publish_lio_tf_ = false;
             pcd_save_en = false;
+            temporal_export_enabled_ = false;
 
             RCLCPP_WARN(
                 this->get_logger(),
@@ -1247,30 +1334,78 @@ public:
 
         if (pcd_save_en)
         {
-            if (map_file_path.empty()) {
-                throw std::invalid_argument("map_file_path must not be empty when pcd_save.pcd_save_en is true");
+            if (map_file_path.empty())
+            {
+                throw std::invalid_argument(
+                    "map_file_path must not be empty when pcd_save.pcd_save_en is true");
             }
 
-            if (pcd_save_voxel_size_ <= 0.0) {
+            if (pcd_save_voxel_size_ <= 0.0)
+            {
                 throw std::invalid_argument("pcd_save.voxel_size must be > 0");
             }
 
-            if (pcd_save_scan_stride_ < 1) {
+            if (pcd_save_scan_stride_ < 1)
+            {
                 throw std::invalid_argument("pcd_save.scan_stride must be >= 1");
             }
 
-            if (pcd_save_max_voxels_ < 0 || pcd_save_reserve_voxels_ < 0) {
-                throw std::invalid_argument("pcd_save.max_voxels and pcd_save.reserve_voxels must be >= 0");
+            if (pcd_save_max_voxels_ < 0 || pcd_save_reserve_voxels_ < 0)
+            {
+                throw std::invalid_argument(
+                    "pcd_save.max_voxels and pcd_save.reserve_voxels must be >= 0");
             }
 
-            if (pcd_save_min_range_ < 0.0 || pcd_save_max_range_ <= pcd_save_min_range_) {
-                throw std::invalid_argument("pcd_save range must satisfy 0 <= min_range < max_range");
+            if (
+                pcd_save_min_range_ < 0.0 ||
+                pcd_save_max_range_ <= pcd_save_min_range_)
+            {
+                throw std::invalid_argument(
+                    "pcd_save range must satisfy 0 <= min_range < max_range");
             }
 
             if (pcd_save_reserve_voxels_ > 0)
             {
-                saved_map_voxels_.reserve(static_cast<std::size_t>(pcd_save_reserve_voxels_));
+                saved_map_voxels_.reserve(
+                    static_cast<std::size_t>(pcd_save_reserve_voxels_));
             }
+        }
+
+        if (temporal_export_enabled_)
+        {
+            if (temporal_output_dir_.empty() && map_file_path.empty())
+            {
+                throw std::invalid_argument(
+                    "pcd_save.temporal_export.output_dir must be set when "
+                    "map_file_path is empty");
+            }
+
+            if (temporal_scans_per_chunk_ < 1)
+            {
+                throw std::invalid_argument(
+                    "pcd_save.temporal_export.scans_per_chunk must be >= 1");
+            }
+
+            if (temporal_max_pending_chunks_ < 1)
+            {
+                throw std::invalid_argument(
+                    "pcd_save.temporal_export.max_pending_chunks must be >= 1");
+            }
+
+            if (temporal_scan_stride_ < 1 || temporal_point_stride_ < 1)
+            {
+                throw std::invalid_argument(
+                    "pcd_save.temporal_export scan_stride and point_stride must be >= 1");
+            }
+
+            if (
+                pcd_save_min_range_ < 0.0 ||
+                pcd_save_max_range_ <= pcd_save_min_range_)
+            {
+                throw std::invalid_argument(
+                    "pcd_save range must satisfy 0 <= min_range < max_range");
+            }
+
         }
 
         const double minimum_cube_side = 2.0 * MOV_THRESHOLD * static_cast<double>(DET_RANGE);
@@ -1293,6 +1428,11 @@ public:
         if (imu_queue_warn_size_ < 1)
         {
             throw std::invalid_argument("processing.imu_queue_warn_size must be >= 1");
+        }
+
+        if (temporal_export_enabled_)
+        {
+            initialize_temporal_export();
         }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
@@ -1331,6 +1471,20 @@ public:
             pcd_save_min_range_,
             pcd_save_max_range_,
             static_cast<long>(pcd_save_max_voxels_));
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Temporal export: enabled=%s, output_dir='%s', scans_per_chunk=%d, "
+            "max_pending_chunks=%d, scan_stride=%d, point_stride=%d, dense=%s, "
+            "trajectory_knots=%s",
+            temporal_export_enabled_ ? "true" : "false",
+            temporal_output_dir_.c_str(),
+            temporal_scans_per_chunk_,
+            temporal_max_pending_chunks_,
+            temporal_scan_stride_,
+            temporal_point_stride_,
+            temporal_use_dense_cloud_ ? "true" : "false",
+            temporal_write_trajectory_knots_ ? "true" : "false");
 
         #ifdef MP_EN
         RCLCPP_INFO(
@@ -1462,10 +1616,34 @@ public:
                 rclcpp::ServicesQoS(),
                 mapping_callback_group_);
         }
+
+        if (temporal_export_enabled_)
+        {
+            temporal_writer_thread_ = std::thread(
+                &LaserMappingNode::temporal_writer_loop,
+                this);
+        }
+
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
     ~LaserMappingNode() override {
+        if (temporal_export_enabled_)
+        {
+            std::string temporal_message;
+            if (!shutdown_temporal_export(temporal_message))
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Temporal export shutdown failed: %s",
+                    temporal_message.c_str());
+            }
+            else
+            {
+                RCLCPP_INFO(this->get_logger(), "%s", temporal_message.c_str());
+            }
+        }
+
         if (pcd_save_en && pcd_save_on_shutdown_ && saved_map_dirty_)
         {
             std::string save_message;
@@ -1820,27 +1998,511 @@ private:
         publish_map(pubLaserCloudMap_, lio_world_frame_, latest_T_map_lio_);
     }
 
-    void accumulate_map_for_save(const tf2::Transform & T_map_lio) {
-        if (!pcd_save_en) return;
-    
+    std::string temporal_global_frame_id() const
+    {
+        if (rep105_enable_ && rep105_publish_map_to_odom_tf_)
+        {
+            return rep105_map_frame_;
+        }
+        return lio_world_frame_;
+    }
 
-        ++pcd_save_seen_scans_;
-        if (((pcd_save_seen_scans_ - 1U) % static_cast<std::uint64_t>(pcd_save_scan_stride_)) != 0U) return;
-    
+    void initialize_temporal_export()
+    {
+        namespace fs = std::filesystem;
+
+        fs::path requested_path;
+        if (!temporal_output_dir_.empty())
+        {
+            requested_path = fs::path(temporal_output_dir_);
+        }
+        else
+        {
+            const fs::path map_path(map_file_path);
+            requested_path = map_path.parent_path() /
+                (map_path.stem().string() + "_temporal");
+        }
+
+        fs::path selected_path = requested_path;
+        for (std::uint32_t suffix = 1U;; ++suffix)
+        {
+            std::error_code filesystem_error;
+            const bool path_exists = fs::exists(selected_path, filesystem_error);
+            if (filesystem_error)
+            {
+                throw std::runtime_error(
+                    "Cannot inspect temporal export path '" +
+                    selected_path.string() + "': " + filesystem_error.message());
+            }
+
+            if (!path_exists)
+            {
+                break;
+            }
+
+            const bool is_directory = fs::is_directory(selected_path, filesystem_error);
+            if (filesystem_error)
+            {
+                throw std::runtime_error(
+                    "Cannot inspect temporal export path type '" +
+                    selected_path.string() + "': " + filesystem_error.message());
+            }
+
+            if (is_directory)
+            {
+                const bool is_empty = fs::is_empty(selected_path, filesystem_error);
+                if (filesystem_error)
+                {
+                    throw std::runtime_error(
+                        "Cannot inspect temporal export directory '" +
+                        selected_path.string() + "': " + filesystem_error.message());
+                }
+                if (is_empty)
+                {
+                    break;
+                }
+            }
+
+            std::ostringstream suffixed_name;
+            suffixed_name << requested_path.string() << "_" <<
+                std::setw(3) << std::setfill('0') << suffix;
+            selected_path = fs::path(suffixed_name.str());
+        }
+
+        std::error_code filesystem_error;
+        fs::create_directories(selected_path, filesystem_error);
+        if (filesystem_error)
+        {
+            throw std::runtime_error(
+                "Cannot create temporal export directory '" +
+                selected_path.string() + "': " + filesystem_error.message());
+        }
+
+        temporal_output_dir_ = selected_path.string();
+
+        {
+            std::ofstream scans_file(selected_path / "scans.csv", std::ios::out | std::ios::trunc);
+            if (!scans_file.is_open())
+            {
+                throw std::runtime_error("Cannot create temporal scans.csv");
+            }
+            scans_file <<
+                "scan_id,begin_time_sec,end_time_sec,source_points,exported_points,"
+                "trajectory_knots,start_x,start_y,start_z,start_qx,start_qy,start_qz,start_qw,"
+                "end_x,end_y,end_z,end_qx,end_qy,end_qz,end_qw\n";
+        }
+
+        {
+            std::ofstream trajectory_file(
+                selected_path / "trajectory.csv",
+                std::ios::out | std::ios::trunc);
+            if (!trajectory_file.is_open())
+            {
+                throw std::runtime_error("Cannot create temporal trajectory.csv");
+            }
+            trajectory_file <<
+                "scan_id,knot_index,time_offset_sec,timestamp_sec,x,y,z,qx,qy,qz,qw\n";
+        }
+
+        {
+            std::ofstream chunks_file(selected_path / "chunks.csv", std::ios::out | std::ios::trunc);
+            if (!chunks_file.is_open())
+            {
+                throw std::runtime_error("Cannot create temporal chunks.csv");
+            }
+            chunks_file <<
+                "chunk_index,filename,first_scan_id,last_scan_id,scan_count,point_count\n";
+        }
+
+        {
+            std::ofstream metadata_file(
+                selected_path / "metadata.yaml",
+                std::ios::out | std::ios::trunc);
+            if (!metadata_file.is_open())
+            {
+                throw std::runtime_error("Cannot create temporal metadata.yaml");
+            }
+
+            metadata_file <<
+                "format_version: 1\n"
+                "frame_id: \"" << temporal_global_frame_id() << "\"\n"
+                "point_cloud_format: pcd_binary\n"
+                "point_record_size_bytes: 32\n"
+                "point_fields:\n"
+                "  - {name: x, type: float32, unit: m}\n"
+                "  - {name: y, type: float32, unit: m}\n"
+                "  - {name: z, type: float32, unit: m}\n"
+                "  - {name: intensity, type: float32}\n"
+                "  - {name: time_offset_sec, type: float32, unit: s}\n"
+                "  - {name: scan_id, type: uint32}\n"
+                "  - {name: timestamp_sec, type: float64, unit: s}\n"
+                "timestamp_reference: ROS time from the original LiDAR message\n"
+                "time_offset_reference: scan begin\n"
+                "trajectory_knots_enabled: " <<
+                    (temporal_write_trajectory_knots_ ? "true" : "false") << "\n"
+                "trajectory_semantics: >-\n"
+                "  IMU-predicted intra-scan trajectory rigidly corrected so the final\n"
+                "  LiDAR pose matches the post-EKF FAST-LIO state. Interpolate trajectory.csv\n"
+                "  by scan_id and time_offset_sec to recover the LiDAR ray origin.\n"
+                "range_min_m: " << std::setprecision(17) << pcd_save_min_range_ << "\n"
+                "range_max_m: " << pcd_save_max_range_ << "\n"
+                "scan_stride: " << temporal_scan_stride_ << "\n"
+                "point_stride: " << temporal_point_stride_ << "\n"
+                "use_dense_cloud: " << (temporal_use_dense_cloud_ ? "true" : "false") << "\n";
+        }
+    }
+
+    bool write_temporal_chunk(
+        TemporalExportChunk & chunk,
+        std::string & error_message)
+    {
+        namespace fs = std::filesystem;
+
+        std::ostringstream file_name_stream;
+        file_name_stream << "observations_" << std::setw(6) << std::setfill('0') <<
+            chunk.chunk_index << ".pcd";
+        const std::string file_name = file_name_stream.str();
+
+        const fs::path output_path = fs::path(temporal_output_dir_) / file_name;
+        fs::path temporary_path = output_path;
+        temporary_path += ".tmp";
+
+        const std::uint16_t endian_probe = 1U;
+        if (*reinterpret_cast<const std::uint8_t *>(&endian_probe) != 1U)
+        {
+            error_message =
+                "Temporal PCD binary writer currently requires a little-endian host.";
+            return false;
+        }
+
+        std::ofstream pcd_file(
+            temporary_path,
+            std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!pcd_file.is_open())
+        {
+            error_message = "Cannot create " + temporary_path.string();
+            return false;
+        }
+
+        pcd_file <<
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z intensity time_offset_sec scan_id timestamp_sec\n"
+            "SIZE 4 4 4 4 4 4 8\n"
+            "TYPE F F F F F U F\n"
+            "COUNT 1 1 1 1 1 1 1\n"
+            "WIDTH " << chunk.points.size() << "\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            "POINTS " << chunk.points.size() << "\n"
+            "DATA binary\n";
+
+        if (!chunk.points.empty())
+        {
+            pcd_file.write(
+                reinterpret_cast<const char *>(chunk.points.data()),
+                static_cast<std::streamsize>(
+                    chunk.points.size() * sizeof(TemporalObservationPoint)));
+        }
+        pcd_file.close();
+
+        if (!pcd_file.good())
+        {
+            std::error_code cleanup_error;
+            fs::remove(temporary_path, cleanup_error);
+            error_message = "Failed while writing " + output_path.string();
+            return false;
+        }
+
+        std::error_code rename_error;
+        fs::rename(temporary_path, output_path, rename_error);
+        if (rename_error)
+        {
+            std::error_code cleanup_error;
+            fs::remove(temporary_path, cleanup_error);
+            error_message =
+                "Cannot move temporal chunk to final path: " +
+                rename_error.message();
+            return false;
+        }
+
+        {
+            std::ofstream scans_file(
+                fs::path(temporal_output_dir_) / "scans.csv",
+                std::ios::out | std::ios::app);
+            if (!scans_file.is_open())
+            {
+                error_message = "Cannot append temporal scans.csv";
+                return false;
+            }
+            for (const std::string & row : chunk.scan_rows)
+            {
+                scans_file << row << '\n';
+            }
+            if (!scans_file.good())
+            {
+                error_message = "Failed while appending temporal scans.csv";
+                return false;
+            }
+        }
+
+        if (temporal_write_trajectory_knots_)
+        {
+            std::ofstream trajectory_file(
+                fs::path(temporal_output_dir_) / "trajectory.csv",
+                std::ios::out | std::ios::app);
+            if (!trajectory_file.is_open())
+            {
+                error_message = "Cannot append temporal trajectory.csv";
+                return false;
+            }
+            for (const std::string & row : chunk.trajectory_rows)
+            {
+                trajectory_file << row << '\n';
+            }
+            if (!trajectory_file.good())
+            {
+                error_message = "Failed while appending temporal trajectory.csv";
+                return false;
+            }
+        }
+
+        {
+            std::ofstream chunks_file(
+                fs::path(temporal_output_dir_) / "chunks.csv",
+                std::ios::out | std::ios::app);
+            if (!chunks_file.is_open())
+            {
+                error_message = "Cannot append temporal chunks.csv";
+                return false;
+            }
+            chunks_file << chunk.chunk_index << ',' << file_name << ',' <<
+                chunk.first_scan_id << ',' << chunk.last_scan_id << ',' <<
+                chunk.scan_count << ',' << chunk.points.size() << '\n';
+            if (!chunks_file.good())
+            {
+                error_message = "Failed while appending temporal chunks.csv";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void temporal_writer_loop()
+    {
+        while (true)
+        {
+            TemporalExportChunk chunk;
+            {
+                std::unique_lock<std::mutex> lock(temporal_writer_mutex_);
+                temporal_writer_cv_.wait(lock, [this]() {
+                    return temporal_writer_stop_ || !temporal_pending_chunks_.empty();
+                });
+
+                if (temporal_writer_stop_ && temporal_pending_chunks_.empty())
+                {
+                    break;
+                }
+
+                chunk = std::move(temporal_pending_chunks_.front());
+                temporal_pending_chunks_.pop_front();
+                temporal_writer_busy_ = true;
+                temporal_writer_done_cv_.notify_all();
+            }
+
+            std::string error_message;
+            const bool write_ok = write_temporal_chunk(chunk, error_message);
+
+            {
+                std::lock_guard<std::mutex> lock(temporal_writer_mutex_);
+                temporal_writer_busy_ = false;
+                if (write_ok)
+                {
+                    ++temporal_written_chunks_;
+                    temporal_written_points_ += chunk.points.size();
+                }
+                else
+                {
+                    temporal_writer_failed_ = true;
+                    temporal_writer_error_ = error_message;
+                    temporal_pending_chunks_.clear();
+                }
+                temporal_writer_done_cv_.notify_all();
+            }
+
+            if (!write_ok)
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Temporal export writer failed: %s",
+                    error_message.c_str());
+                break;
+            }
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Temporal chunk %06lu written: scans=%lu, points=%zu, ids=[%lu,%lu]",
+                static_cast<unsigned long>(chunk.chunk_index),
+                static_cast<unsigned long>(chunk.scan_count),
+                chunk.points.size(),
+                static_cast<unsigned long>(chunk.first_scan_id),
+                static_cast<unsigned long>(chunk.last_scan_id));
+        }
+    }
+
+    bool enqueue_active_temporal_chunk(std::string & error_message)
+    {
+        if (temporal_active_chunk_.scan_count == 0U)
+        {
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(temporal_writer_mutex_);
+        temporal_writer_done_cv_.wait(lock, [this]() {
+            return temporal_writer_failed_ || temporal_writer_stop_ ||
+                temporal_pending_chunks_.size() <
+                    static_cast<std::size_t>(temporal_max_pending_chunks_);
+        });
+
+        if (temporal_writer_failed_)
+        {
+            error_message = temporal_writer_error_;
+            return false;
+        }
+        if (temporal_writer_stop_)
+        {
+            error_message = "Temporal writer is already stopping.";
+            return false;
+        }
+
+        temporal_active_chunk_.chunk_index = temporal_next_chunk_index_++;
+        temporal_pending_chunks_.push_back(std::move(temporal_active_chunk_));
+        temporal_active_chunk_ = TemporalExportChunk{};
+        lock.unlock();
+        temporal_writer_cv_.notify_one();
+        return true;
+    }
+
+    bool flush_temporal_export(std::string & message)
+    {
+        if (!temporal_export_enabled_)
+        {
+            message = "Temporal export disabled.";
+            return true;
+        }
+
+        std::string enqueue_error;
+        if (!enqueue_active_temporal_chunk(enqueue_error))
+        {
+            message = enqueue_error;
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(temporal_writer_mutex_);
+        temporal_writer_done_cv_.wait(lock, [this]() {
+            return temporal_writer_failed_ ||
+                (temporal_pending_chunks_.empty() && !temporal_writer_busy_);
+        });
+
+        if (temporal_writer_failed_)
+        {
+            message = temporal_writer_error_;
+            return false;
+        }
+
+        message =
+            "Temporal observations flushed to " + temporal_output_dir_ +
+            " (chunks=" + std::to_string(temporal_written_chunks_) +
+            ", scans=" + std::to_string(temporal_exported_scans_) +
+            ", points=" + std::to_string(temporal_written_points_) + ").";
+        return true;
+    }
+
+    bool shutdown_temporal_export(std::string & message)
+    {
+        const bool flush_ok = flush_temporal_export(message);
+
+        {
+            std::lock_guard<std::mutex> lock(temporal_writer_mutex_);
+            temporal_writer_stop_ = true;
+        }
+        temporal_writer_cv_.notify_all();
+        temporal_writer_done_cv_.notify_all();
+
+        if (temporal_writer_thread_.joinable())
+        {
+            temporal_writer_thread_.join();
+        }
+
+        return flush_ok;
+    }
+
+    static void append_transform_to_csv(
+        std::ostringstream & row,
+        const tf2::Transform & transform)
+    {
+        const tf2::Vector3 & translation = transform.getOrigin();
+        tf2::Quaternion quaternion = transform.getRotation();
+        quaternion.normalize();
+
+        row << ',' << translation.x() << ',' << translation.y() << ',' <<
+            translation.z() << ',' << quaternion.x() << ',' << quaternion.y() <<
+            ',' << quaternion.z() << ',' << quaternion.w();
+    }
+
+    void append_temporal_scan(
+        const std::uint64_t scan_id,
+        const tf2::Transform & T_map_lio)
+    {
+        {
+            std::lock_guard<std::mutex> lock(temporal_writer_mutex_);
+            if (temporal_writer_failed_ || temporal_writer_stop_)
+            {
+                return;
+            }
+        }
+
+        if (scan_id > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        {
+            RCLCPP_ERROR_ONCE(
+                this->get_logger(),
+                "Temporal export scan_id exceeded uint32 capacity. Further scans are skipped.");
+            return;
+        }
 
         const PointCloudXYZI::Ptr source_cloud =
-            pcd_save_use_dense_cloud_ ? feats_undistort : feats_down_body;
-
-        if (source_cloud == nullptr || source_cloud->empty()) return;
-
-        const double minimum_range_squared = pcd_save_min_range_ * pcd_save_min_range_;
-        const double maximum_range_squared = pcd_save_max_range_ * pcd_save_max_range_;
-        bool reached_capacity = false;
-
-        for (const PointType & source_point : source_cloud->points)
+            temporal_use_dense_cloud_ ? feats_undistort : feats_down_body;
+        if (source_cloud == nullptr || source_cloud->empty())
         {
-            const double range_squared = static_cast<double>(source_point.x) * source_point.x + static_cast<double>(source_point.y) * source_point.y + static_cast<double>(source_point.z) * source_point.z;
+            return;
+        }
 
+        const double scan_duration_sec =
+            std::max(0.0, Measures.lidar_end_time - Measures.lidar_beg_time);
+        const double minimum_range_squared =
+            pcd_save_min_range_ * pcd_save_min_range_;
+        const double maximum_range_squared =
+            pcd_save_max_range_ * pcd_save_max_range_;
+
+        std::size_t exported_points = 0U;
+        temporal_active_chunk_.points.reserve(
+            temporal_active_chunk_.points.size() +
+            source_cloud->points.size() /
+                static_cast<std::size_t>(temporal_point_stride_) + 1U);
+
+        for (std::size_t index = 0U; index < source_cloud->points.size(); ++index)
+        {
+            if ((index % static_cast<std::size_t>(temporal_point_stride_)) != 0U)
+            {
+                continue;
+            }
+
+            const PointType & source_point = source_cloud->points[index];
+            const double range_squared =
+                static_cast<double>(source_point.x) * source_point.x +
+                static_cast<double>(source_point.y) * source_point.y +
+                static_cast<double>(source_point.z) * source_point.z;
             if (
                 !std::isfinite(range_squared) ||
                 range_squared < minimum_range_squared ||
@@ -1854,7 +2516,178 @@ private:
             RGBpointBodyToWorld(&source_point, &point_lio_world);
             transform_lio_world_point_to_map(point_lio_world, &point_map, T_map_lio);
 
-            if (!std::isfinite(point_map.x) || !std::isfinite(point_map.y) || !std::isfinite(point_map.z) || !std::isfinite(point_map.intensity)) {
+            if (
+                !std::isfinite(point_map.x) ||
+                !std::isfinite(point_map.y) ||
+                !std::isfinite(point_map.z) ||
+                !std::isfinite(point_map.intensity))
+            {
+                continue;
+            }
+
+            double time_offset_sec =
+                static_cast<double>(source_point.curvature) / 1000.0;
+            if (!std::isfinite(time_offset_sec))
+            {
+                continue;
+            }
+            time_offset_sec = std::clamp(time_offset_sec, 0.0, scan_duration_sec);
+
+            TemporalObservationPoint output_point{};
+            output_point.x = point_map.x;
+            output_point.y = point_map.y;
+            output_point.z = point_map.z;
+            output_point.intensity = point_map.intensity;
+            output_point.time_offset_sec = static_cast<float>(time_offset_sec);
+            output_point.scan_id = static_cast<std::uint32_t>(scan_id);
+            output_point.timestamp_sec = Measures.lidar_beg_time + time_offset_sec;
+            temporal_active_chunk_.points.push_back(output_point);
+            ++exported_points;
+        }
+
+        if (exported_points == 0U)
+        {
+            return;
+        }
+
+        ImuProcess::TimedLidarPoseVector trajectory =
+            p_imu->corrected_lidar_trajectory(state_point);
+
+        std::vector<tf2::Transform> map_trajectory;
+        map_trajectory.reserve(
+            std::max<std::size_t>(trajectory.size(), std::size_t{1}));
+        for (const ImuProcess::TimedLidarPose & pose : trajectory)
+        {
+            map_trajectory.push_back(
+                T_map_lio * make_transform_from_eigen(
+                    pose.rotation_lio_lidar,
+                    pose.position_lio_lidar));
+        }
+
+        if (map_trajectory.empty())
+        {
+            map_trajectory.push_back(T_map_lio * make_lio_tracking_transform());
+        }
+
+        if (temporal_write_trajectory_knots_)
+        {
+            for (std::size_t knot_index = 0U; knot_index < map_trajectory.size(); ++knot_index)
+            {
+                const double offset_sec = trajectory.empty() ? scan_duration_sec :
+                    std::clamp(
+                        trajectory[knot_index].offset_time_sec,
+                        0.0,
+                        scan_duration_sec);
+
+                std::ostringstream trajectory_row;
+                trajectory_row << std::setprecision(17) << scan_id << ',' <<
+                    knot_index << ',' << offset_sec << ',' <<
+                    (Measures.lidar_beg_time + offset_sec);
+                append_transform_to_csv(trajectory_row, map_trajectory[knot_index]);
+                temporal_active_chunk_.trajectory_rows.push_back(trajectory_row.str());
+            }
+        }
+
+        std::ostringstream scan_row;
+        scan_row << std::setprecision(17) << scan_id << ',' <<
+            Measures.lidar_beg_time << ',' << Measures.lidar_end_time << ',' <<
+            source_cloud->points.size() << ',' << exported_points << ',' <<
+            map_trajectory.size();
+        append_transform_to_csv(scan_row, map_trajectory.front());
+        append_transform_to_csv(scan_row, map_trajectory.back());
+        temporal_active_chunk_.scan_rows.push_back(scan_row.str());
+
+        if (temporal_active_chunk_.scan_count == 0U)
+        {
+            temporal_active_chunk_.first_scan_id = scan_id;
+        }
+        temporal_active_chunk_.last_scan_id = scan_id;
+        ++temporal_active_chunk_.scan_count;
+        ++temporal_exported_scans_;
+        temporal_exported_points_ += exported_points;
+
+        if (
+            temporal_active_chunk_.scan_count >=
+            static_cast<std::uint64_t>(temporal_scans_per_chunk_))
+        {
+            std::string enqueue_error;
+            if (!enqueue_active_temporal_chunk(enqueue_error))
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Cannot enqueue temporal export chunk: %s",
+                    enqueue_error.c_str());
+            }
+        }
+    }
+
+    void accumulate_map_for_save(const tf2::Transform & T_map_lio)
+    {
+        if (!pcd_save_en && !temporal_export_enabled_)
+        {
+            return;
+        }
+
+        const std::uint64_t temporal_scan_id = temporal_source_scan_counter_++;
+        if (
+            temporal_export_enabled_ &&
+            (temporal_scan_id % static_cast<std::uint64_t>(temporal_scan_stride_)) == 0U)
+        {
+            append_temporal_scan(temporal_scan_id, T_map_lio);
+        }
+
+        if (!pcd_save_en)
+        {
+            return;
+        }
+
+        ++pcd_save_seen_scans_;
+        if (((pcd_save_seen_scans_ - 1U) % static_cast<std::uint64_t>(pcd_save_scan_stride_)) != 0U)
+        {
+            return;
+        }
+
+        const PointCloudXYZI::Ptr source_cloud =
+            pcd_save_use_dense_cloud_ ? feats_undistort : feats_down_body;
+
+        if (source_cloud == nullptr || source_cloud->empty())
+        {
+            return;
+        }
+
+        const double minimum_range_squared = pcd_save_min_range_ * pcd_save_min_range_;
+        const double maximum_range_squared = pcd_save_max_range_ * pcd_save_max_range_;
+        bool reached_capacity = false;
+
+        for (const PointType & source_point : source_cloud->points)
+        {
+            const double range_squared =
+                static_cast<double>(source_point.x) * source_point.x +
+                static_cast<double>(source_point.y) * source_point.y +
+                static_cast<double>(source_point.z) * source_point.z;
+
+            if (
+                !std::isfinite(range_squared) ||
+                range_squared < minimum_range_squared ||
+                range_squared > maximum_range_squared)
+            {
+                continue;
+            }
+
+            PointType point_lio_world;
+            PointType point_map;
+            RGBpointBodyToWorld(&source_point, &point_lio_world);
+            transform_lio_world_point_to_map(
+                point_lio_world,
+                &point_map,
+                T_map_lio);
+
+            if (
+                !std::isfinite(point_map.x) ||
+                !std::isfinite(point_map.y) ||
+                !std::isfinite(point_map.z) ||
+                !std::isfinite(point_map.intensity))
+            {
                 continue;
             }
 
@@ -1867,13 +2700,17 @@ private:
             if (voxel == saved_map_voxels_.end())
             {
                 if (
-                    pcd_save_max_voxels_ > 0 && saved_map_voxels_.size() >= static_cast<std::size_t>(pcd_save_max_voxels_))
+                    pcd_save_max_voxels_ > 0 &&
+                    saved_map_voxels_.size() >=
+                        static_cast<std::size_t>(pcd_save_max_voxels_))
                 {
                     reached_capacity = true;
                     continue;
                 }
 
-                voxel = saved_map_voxels_.emplace(key, SavedMapVoxelAccumulator{}).first;
+                voxel = saved_map_voxels_.emplace(
+                    key,
+                    SavedMapVoxelAccumulator{}).first;
             }
 
             SavedMapVoxelAccumulator & accumulator = voxel->second;
@@ -1885,8 +2722,10 @@ private:
             ++pcd_save_accepted_points_;
         }
 
-        if (!saved_map_voxels_.empty()) saved_map_dirty_ = true;
-        
+        if (!saved_map_voxels_.empty())
+        {
+            saved_map_dirty_ = true;
+        }
 
         if (reached_capacity)
         {
@@ -1933,13 +2772,16 @@ private:
         }
 
         std::error_code directory_error;
-        if (!output_path.parent_path().empty()) {
+        if (!output_path.parent_path().empty())
+        {
             fs::create_directories(output_path.parent_path(), directory_error);
         }
 
         if (directory_error)
         {
-            message = "Cannot create map output directory: " + directory_error.message();
+            message =
+                "Cannot create map output directory: " +
+                directory_error.message();
             return false;
         }
 
@@ -1949,16 +2791,20 @@ private:
         for (const auto & entry : saved_map_voxels_)
         {
             const SavedMapVoxelAccumulator & accumulator = entry.second;
-            if (accumulator.count == 0U) continue;
-            
+            if (accumulator.count == 0U)
+            {
+                continue;
+            }
 
-            const double inverse_count = 1.0 / static_cast<double>(accumulator.count);
+            const double inverse_count =
+                1.0 / static_cast<double>(accumulator.count);
 
             pcl::PointXYZI point;
             point.x = static_cast<float>(accumulator.x_sum * inverse_count);
             point.y = static_cast<float>(accumulator.y_sum * inverse_count);
             point.z = static_cast<float>(accumulator.z_sum * inverse_count);
-            point.intensity = static_cast<float>(accumulator.intensity_sum * inverse_count);
+            point.intensity = static_cast<float>(
+                accumulator.intensity_sum * inverse_count);
             output_cloud.points.push_back(point);
         }
 
@@ -2026,12 +2872,53 @@ private:
         return true;
     }
 
+    bool save_all_exports(std::string & message)
+    {
+        bool any_export_enabled = false;
+        bool success = true;
+        bool has_message = false;
+        std::ostringstream combined_message;
+
+        if (pcd_save_en)
+        {
+            any_export_enabled = true;
+            std::string map_message;
+            const bool map_success = save_accumulated_map(map_message);
+            success = success && map_success;
+            combined_message << map_message;
+            has_message = true;
+        }
+
+        if (temporal_export_enabled_)
+        {
+            any_export_enabled = true;
+            std::string temporal_message;
+            const bool temporal_success = flush_temporal_export(temporal_message);
+            success = success && temporal_success;
+            if (has_message)
+            {
+                combined_message << ' ';
+            }
+            combined_message << temporal_message;
+            has_message = true;
+        }
+
+        if (!any_export_enabled)
+        {
+            message = "Both compact map saving and temporal export are disabled.";
+            return false;
+        }
+
+        message = combined_message.str();
+        return success;
+    }
+
     void map_save_callback(
         std_srvs::srv::Trigger::Request::ConstSharedPtr request,
         std_srvs::srv::Trigger::Response::SharedPtr response)
     {
         static_cast<void>(request);
-        response->success = save_accumulated_map(response->message);
+        response->success = save_all_exports(response->message);
 
         if (response->success)
         {
@@ -2261,6 +3148,33 @@ private:
     std::int64_t pcd_save_reserve_voxels_ = 1000000;
     std::uint64_t pcd_save_seen_scans_ = 0U;
     std::uint64_t pcd_save_accepted_points_ = 0U;
+
+    bool temporal_export_enabled_ = false;
+    bool temporal_use_dense_cloud_ = true;
+    bool temporal_write_trajectory_knots_ = true;
+    std::string temporal_output_dir_;
+    int temporal_scans_per_chunk_ = 200;
+    int temporal_max_pending_chunks_ = 2;
+    int temporal_scan_stride_ = 1;
+    int temporal_point_stride_ = 1;
+
+    TemporalExportChunk temporal_active_chunk_;
+    std::deque<TemporalExportChunk> temporal_pending_chunks_;
+    std::thread temporal_writer_thread_;
+    std::mutex temporal_writer_mutex_;
+    std::condition_variable temporal_writer_cv_;
+    std::condition_variable temporal_writer_done_cv_;
+    bool temporal_writer_stop_ = false;
+    bool temporal_writer_busy_ = false;
+    bool temporal_writer_failed_ = false;
+    std::string temporal_writer_error_;
+
+    std::uint64_t temporal_source_scan_counter_ = 0U;
+    std::uint64_t temporal_next_chunk_index_ = 1U;
+    std::uint64_t temporal_exported_scans_ = 0U;
+    std::uint64_t temporal_exported_points_ = 0U;
+    std::uint64_t temporal_written_chunks_ = 0U;
+    std::uint64_t temporal_written_points_ = 0U;
 
     bool effect_pub_en = false, map_pub_en = false;
     bool rep105_enable_ = false;
