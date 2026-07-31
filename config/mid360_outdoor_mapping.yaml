@@ -140,7 +140,7 @@
       #   0.10 m -> mas detalle, bastante mas RAM y disco
       #   0.15 m -> valor recomendado de partida
       #   0.20-0.25 m -> campañas muy largas o memoria limitada
-      voxel_size: 0.1
+      voxel_size: 0.10
 
       # Integra uno de cada N scans en el mapa exportable. Con 1 se aprovecha
       # toda la densidad; usar 2 si el acumulador compite con el registro.
