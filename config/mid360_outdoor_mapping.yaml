@@ -140,7 +140,7 @@
       #   0.10 m -> mas detalle, bastante mas RAM y disco
       #   0.15 m -> valor recomendado de partida
       #   0.20-0.25 m -> campañas muy largas o memoria limitada
-      voxel_size: 0.10
+      voxel_size: 0.05
 
       # Integra uno de cada N scans en el mapa exportable. Con 1 se aprovecha
       # toda la densidad; usar 2 si el acumulador compite con el registro.
@@ -153,10 +153,10 @@
       # Limite de seguridad para evitar agotar RAM. Al alcanzarlo se actualizan
       # voxeles ya existentes, pero no se abren voxeles de zonas nuevas.
       # 0 desactiva el limite, lo cual no se recomienda en la Jetson.
-      max_voxels: 20000000
+      max_voxels: 0
 
       # Reserva inicial del hash para reducir realojos; no crea puntos.
-      reserve_voxels: 2000000
+      reserve_voxels: 20000000
 
       # Rango de los puntos que se incorporan al fichero final.
       min_range: 0.50
