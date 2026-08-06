@@ -141,6 +141,12 @@ Edit ``` config/avia.yaml ``` to set the below parameters:
 
 ### 3.4 PCD/PLY map save
 
+This fork initializes the global world with `map.Z` opposite to gravity when
+`gravity_alignment.enabled=true`. Keep the robot stationary during startup and
+use `rep105.initial_alignment_mode: yaw_only` so REP-105 does not reintroduce
+roll/pitch. See [GRAVITY_ALIGNMENT.md](GRAVITY_ALIGNMENT.md) for the full
+configuration, validation rules and metadata format.
+
 This fork contains a voxelized global-map accumulator intended for long outdoor
 runs. It is independent of `publish.map_en`, so `/Laser_map` can remain disabled
 without producing an empty save file or publishing an ever-growing cloud.
@@ -171,6 +177,10 @@ Relevant parameters:
 The map is written in the REP-105 `map` frame and contains `x`, `y`, `z` and
 `intensity`. For long outdoor routes, start with a 0.15 m output voxel. A 0.10 m
 voxel provides more detail but can require substantially more RAM and disk.
+
+Every compact map also receives `<map>.metadata.yaml`. PLY files contain
+gravity comments in their header so downstream postprocessing can verify that
+the coordinate frame remains gravity-aligned.
 
 `publish.map_en` is only for `/Laser_map` visualization and is not required for
 saving. Keep it disabled during large-area mapping.

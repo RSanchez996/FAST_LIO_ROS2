@@ -21,11 +21,12 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include "gravity_alignment.hpp"
 #include "use-ikfom.hpp"
 
 /// *************Preconfiguration
 
-#define MAX_INI_COUNT (10)
+constexpr int LEGACY_MAX_INI_COUNT = 10;
 
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
@@ -60,6 +61,11 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void set_gravity_alignment_config(
+    const fast_lio::GravityAlignmentConfig & config);
+  bool gravity_alignment_enabled() const;
+  bool gravity_alignment_ready() const;
+  const fast_lio::GravityAlignmentResult & gravity_alignment_result() const;
   TimedLidarPoseVector corrected_lidar_trajectory(
     const state_ikfom & corrected_end_state) const;
   Eigen::Matrix<double, 12, 12> Q;
@@ -96,6 +102,7 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  fast_lio::StationaryImuInitializer gravity_initializer_;
 };
 
 ImuProcess::ImuProcess()
@@ -129,6 +136,7 @@ void ImuProcess::Reset()
   v_imu_.clear();
   IMUpose.clear();
   export_pose_knots_.clear();
+  gravity_initializer_.reset();
   last_imu_.reset(new sensor_msgs::msg::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
@@ -171,6 +179,27 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
+void ImuProcess::set_gravity_alignment_config(
+  const fast_lio::GravityAlignmentConfig & config)
+{
+  gravity_initializer_.configure(config);
+}
+
+bool ImuProcess::gravity_alignment_enabled() const
+{
+  return gravity_initializer_.config().enabled;
+}
+
+bool ImuProcess::gravity_alignment_ready() const
+{
+  return gravity_initializer_.ready();
+}
+
+const fast_lio::GravityAlignmentResult & ImuProcess::gravity_alignment_result() const
+{
+  return gravity_initializer_.result();
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -186,6 +215,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     const auto &imu_acc = meas.imu.front()->linear_acceleration;
     const auto &gyr_acc = meas.imu.front()->angular_velocity;
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+    mean_acc *= gravity_initializer_.config().input_accel_scale_to_m_s2;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
     first_lidar_time = meas.lidar_beg_time;
   }
@@ -195,7 +225,14 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     const auto &imu_acc = imu->linear_acceleration;
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+    cur_acc *= gravity_initializer_.config().input_accel_scale_to_m_s2;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+
+    if (gravity_initializer_.config().enabled)
+    {
+      gravity_initializer_.add_sample(
+        rclcpp::Time(imu->header.stamp).seconds(), cur_acc, cur_gyr);
+    }
 
     mean_acc      += (cur_acc - mean_acc) / N;
     mean_gyr      += (cur_gyr - mean_gyr) / N;
@@ -207,10 +244,34 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
     N ++;
   }
+  if (
+    gravity_initializer_.config().enabled &&
+    !gravity_initializer_.ready())
+  {
+    last_imu_ = meas.imu.back();
+    return;
+  }
+
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
-  
-  //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
+  if (gravity_initializer_.config().enabled)
+  {
+    const fast_lio::GravityAlignmentResult & alignment =
+      gravity_initializer_.result();
+    mean_acc = alignment.mean_accel_imu;
+    mean_gyr = alignment.mean_gyro_imu;
+    cov_acc = alignment.accel_std_imu.cwiseProduct(alignment.accel_std_imu);
+    cov_gyr = alignment.gyro_std_imu.cwiseProduct(alignment.gyro_std_imu);
+    init_state.rot = SO3(alignment.rotation_world_from_imu);
+    init_state.grav = S2(
+      0.0,
+      0.0,
+      -gravity_initializer_.config().gravity_magnitude_m_s2);
+  }
+  else
+  {
+    init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  }
+
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
@@ -272,10 +333,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
                 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
                 0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+    acc_avr *= gravity_initializer_.config().input_accel_scale_to_m_s2;
 
     // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
 
-    acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
+    const double gravity_magnitude = gravity_initializer_.config().enabled ?
+      gravity_initializer_.config().gravity_magnitude_m_s2 : G_m_s2;
+    acc_avr = acc_avr * gravity_magnitude / mean_acc.norm(); // - state_inout.ba;
 
     if(head_stamp < last_lidar_end_time_)
     {
@@ -454,9 +518,13 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     last_imu_   = meas.imu.back();
 
     state_ikfom imu_state = kf_state.get_x();
-    if (init_iter_num > MAX_INI_COUNT)
+    const bool initialization_complete = gravity_initializer_.config().enabled ?
+      gravity_initializer_.ready() : init_iter_num > LEGACY_MAX_INI_COUNT;
+    if (initialization_complete)
     {
-      cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
+      const double gravity_magnitude = gravity_initializer_.config().enabled ?
+        gravity_initializer_.config().gravity_magnitude_m_s2 : G_m_s2;
+      cov_acc *= pow(gravity_magnitude / mean_acc.norm(), 2);
       imu_need_init_ = false;
 
       cov_acc = cov_acc_scale;

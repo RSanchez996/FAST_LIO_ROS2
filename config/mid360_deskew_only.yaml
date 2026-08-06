@@ -161,6 +161,20 @@
                           -0.0025826,  0.9999741, -0.0067201,
                           -0.0126883,  0.0066868,  0.9998971 ]
 
+        gravity_alignment:
+            enabled: true
+            require_stationary: true
+            min_duration_sec: 3.0
+            min_samples: 400
+            max_samples: 4000
+            max_gyro_norm_rad_s: 0.08
+            accel_norm_tolerance_m_s2: 0.60
+            max_accel_std_m_s2: 0.25
+            max_gyro_std_rad_s: 0.02
+            gravity_magnitude_m_s2: 9.80665
+            # livox_ros_driver2 entrega la aceleracion del MID-360 en g.
+            input_accel_scale_to_m_s2: 9.80665
+
             
                         #  [ 0.999930042, -0.011718805, 0.001606515,
                         #    0.011707079,  0.999906094, 0.007123711,
@@ -244,6 +258,7 @@
             # true = map coincide con odom al inicio.
             # El origen y orientación inicial de map serán los de odom, no los de camera_init/FAST-LIO.
             align_map_to_odom_on_start: true
+            initial_alignment_mode: "yaw_only"
             # true = map -> odom sólo tendrá x, y, yaw.
             # Recomendado para Nav2 2D.
             project_map_to_2d: true

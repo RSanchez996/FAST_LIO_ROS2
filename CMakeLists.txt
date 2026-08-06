@@ -7,6 +7,8 @@ endif()
 
 project(fast_lio)
 
+include(CTest)
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -152,5 +154,19 @@ install(
   DIRECTORY config launch rviz
   DESTINATION share/${PROJECT_NAME}
 )
+
+if(BUILD_TESTING)
+  add_executable(
+    gravity_alignment_test
+    test/gravity_alignment_test.cpp
+  )
+  target_include_directories(
+    gravity_alignment_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(gravity_alignment_test Eigen3::Eigen)
+  add_test(NAME gravity_alignment_test COMMAND gravity_alignment_test)
+endif()
 
 ament_package()

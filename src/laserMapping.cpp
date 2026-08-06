@@ -1150,6 +1150,17 @@ public:
         this->declare_parameter<double>("mapping.acc_cov", 0.1);
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
+        this->declare_parameter<bool>("gravity_alignment.enabled", true);
+        this->declare_parameter<bool>("gravity_alignment.require_stationary", true);
+        this->declare_parameter<double>("gravity_alignment.min_duration_sec", 3.0);
+        this->declare_parameter<int>("gravity_alignment.min_samples", 400);
+        this->declare_parameter<int>("gravity_alignment.max_samples", 4000);
+        this->declare_parameter<double>("gravity_alignment.max_gyro_norm_rad_s", 0.08);
+        this->declare_parameter<double>("gravity_alignment.accel_norm_tolerance_m_s2", 0.60);
+        this->declare_parameter<double>("gravity_alignment.max_accel_std_m_s2", 0.25);
+        this->declare_parameter<double>("gravity_alignment.max_gyro_std_rad_s", 0.02);
+        this->declare_parameter<double>("gravity_alignment.gravity_magnitude_m_s2", 9.80665);
+        this->declare_parameter<double>("gravity_alignment.input_accel_scale_to_m_s2", 1.0);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<int>("preprocess.lidar_type", AVIA);
         this->declare_parameter<int>("preprocess.scan_line", 16);
@@ -1188,6 +1199,7 @@ public:
         this->declare_parameter<bool>("rep105.use_latest_robot_tf", true);
         this->declare_parameter<double>("rep105.tf_timeout_sec", 0.05);
         this->declare_parameter<bool>("rep105.align_map_to_odom_on_start", true);
+        this->declare_parameter<std::string>("rep105.initial_alignment_mode", "yaw_only");
         this->declare_parameter<bool>("rep105.project_map_to_2d", false);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
@@ -1227,6 +1239,21 @@ public:
         this->get_parameter_or<double>("mapping.acc_cov",acc_cov,0.1);
         this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
         this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
+        int gravity_min_samples = 400;
+        int gravity_max_samples = 4000;
+        this->get_parameter_or<bool>("gravity_alignment.enabled", gravity_alignment_config_.enabled, true);
+        this->get_parameter_or<bool>("gravity_alignment.require_stationary", gravity_alignment_config_.require_stationary, true);
+        this->get_parameter_or<double>("gravity_alignment.min_duration_sec", gravity_alignment_config_.min_duration_sec, 3.0);
+        this->get_parameter_or<int>("gravity_alignment.min_samples", gravity_min_samples, 400);
+        this->get_parameter_or<int>("gravity_alignment.max_samples", gravity_max_samples, 4000);
+        this->get_parameter_or<double>("gravity_alignment.max_gyro_norm_rad_s", gravity_alignment_config_.max_gyro_norm_rad_s, 0.08);
+        this->get_parameter_or<double>("gravity_alignment.accel_norm_tolerance_m_s2", gravity_alignment_config_.accel_norm_tolerance_m_s2, 0.60);
+        this->get_parameter_or<double>("gravity_alignment.max_accel_std_m_s2", gravity_alignment_config_.max_accel_std_m_s2, 0.25);
+        this->get_parameter_or<double>("gravity_alignment.max_gyro_std_rad_s", gravity_alignment_config_.max_gyro_std_rad_s, 0.02);
+        this->get_parameter_or<double>("gravity_alignment.gravity_magnitude_m_s2", gravity_alignment_config_.gravity_magnitude_m_s2, 9.80665);
+        this->get_parameter_or<double>("gravity_alignment.input_accel_scale_to_m_s2", gravity_alignment_config_.input_accel_scale_to_m_s2, 1.0);
+        gravity_alignment_config_.min_samples = static_cast<std::size_t>(std::max(0, gravity_min_samples));
+        gravity_alignment_config_.max_samples = static_cast<std::size_t>(std::max(0, gravity_max_samples));
         this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
         this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
@@ -1265,6 +1292,7 @@ public:
         this->get_parameter_or<bool>("rep105.use_latest_robot_tf", rep105_use_latest_robot_tf_, true);
         this->get_parameter_or<double>("rep105.tf_timeout_sec", rep105_tf_timeout_sec_, 0.05);
         this->get_parameter_or<bool>("rep105.align_map_to_odom_on_start", rep105_align_map_to_odom_on_start_, true);
+        this->get_parameter_or<std::string>("rep105.initial_alignment_mode", rep105_initial_alignment_mode_, "yaw_only");
         this->get_parameter_or<bool>("rep105.project_map_to_2d", rep105_project_map_to_2d_, false);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
@@ -1330,6 +1358,41 @@ public:
         if (filter_size_surf_min <= 0.0 || filter_size_map_min <= 0.0)
         {
             throw std::invalid_argument("filter_size_surf and filter_size_map must be > 0");
+        }
+
+        if (
+            gravity_alignment_config_.min_duration_sec < 0.0 ||
+            gravity_alignment_config_.min_samples < 2U ||
+            gravity_alignment_config_.max_samples < gravity_alignment_config_.min_samples ||
+            gravity_alignment_config_.max_gyro_norm_rad_s <= 0.0 ||
+            gravity_alignment_config_.accel_norm_tolerance_m_s2 <= 0.0 ||
+            gravity_alignment_config_.max_accel_std_m_s2 <= 0.0 ||
+            gravity_alignment_config_.max_gyro_std_rad_s <= 0.0 ||
+            gravity_alignment_config_.gravity_magnitude_m_s2 <= 0.0 ||
+            gravity_alignment_config_.input_accel_scale_to_m_s2 <= 0.0)
+        {
+            throw std::invalid_argument(
+                "Invalid gravity_alignment configuration: require min_samples >= 2, "
+                "max_samples >= min_samples and positive thresholds/gravity/input scale");
+        }
+
+        if (
+            rep105_initial_alignment_mode_ != "yaw_only" &&
+            rep105_initial_alignment_mode_ != "full_6d" &&
+            rep105_initial_alignment_mode_ != "identity")
+        {
+            throw std::invalid_argument(
+                "rep105.initial_alignment_mode must be identity, yaw_only or full_6d");
+        }
+
+        if (
+            gravity_alignment_config_.enabled &&
+            rep105_align_map_to_odom_on_start_ &&
+            rep105_initial_alignment_mode_ == "full_6d")
+        {
+            throw std::invalid_argument(
+                "rep105.initial_alignment_mode=full_6d can reintroduce roll/pitch "
+                "after gravity alignment; use yaw_only or identity");
         }
 
         if (pcd_save_en)
@@ -1486,6 +1549,31 @@ public:
             temporal_use_dense_cloud_ ? "true" : "false",
             temporal_write_trajectory_knots_ ? "true" : "false");
 
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Gravity alignment: enabled=%s, stationary=%s, duration=%.2f s, "
+            "samples=[%zu,%zu], gyro_norm<=%.3f rad/s, accel_norm_tol=%.3f m/s^2, "
+            "accel_std<=%.3f m/s^2, gyro_std<=%.3f rad/s, g=%.5f m/s^2, "
+            "input_accel_scale=%.5f",
+            gravity_alignment_config_.enabled ? "true" : "false",
+            gravity_alignment_config_.require_stationary ? "true" : "false",
+            gravity_alignment_config_.min_duration_sec,
+            gravity_alignment_config_.min_samples,
+            gravity_alignment_config_.max_samples,
+            gravity_alignment_config_.max_gyro_norm_rad_s,
+            gravity_alignment_config_.accel_norm_tolerance_m_s2,
+            gravity_alignment_config_.max_accel_std_m_s2,
+            gravity_alignment_config_.max_gyro_std_rad_s,
+            gravity_alignment_config_.gravity_magnitude_m_s2,
+            gravity_alignment_config_.input_accel_scale_to_m_s2);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "REP-105 initial alignment: enabled=%s, mode=%s, project_map_to_2d=%s",
+            rep105_align_map_to_odom_on_start_ ? "true" : "false",
+            rep105_initial_alignment_mode_.c_str(),
+            rep105_project_map_to_2d_ ? "true" : "false");
+
         #ifdef MP_EN
         RCLCPP_INFO(
         this->get_logger(),
@@ -1524,6 +1612,7 @@ public:
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+        p_imu->set_gravity_alignment_config(gravity_alignment_config_);
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -1724,22 +1813,34 @@ private:
 
         if (!rep105_initial_alignment_ready_)
         {
-            if (rep105_align_map_to_odom_on_start_)
+            if (
+                !rep105_align_map_to_odom_on_start_ ||
+                rep105_initial_alignment_mode_ == "identity")
             {
-                T_map_lio_initial_ =
-                    T_odom_tracking * T_lio_tracking.inverse();
+                T_map_lio_initial_.setIdentity();
+            }
+            else if (rep105_initial_alignment_mode_ == "yaw_only")
+            {
+                // Preserve the gravity-aligned Z axis produced by FAST-LIO.
+                // Gravity does not observe yaw, so matching only planar yaw and
+                // XY translation to odom is safe and remains constant for the
+                // whole mapping session.
+                T_map_lio_initial_ = project_transform_to_se2(
+                    T_odom_tracking * T_lio_tracking.inverse());
             }
             else
             {
-                T_map_lio_initial_.setIdentity();
+                T_map_lio_initial_ =
+                    T_odom_tracking * T_lio_tracking.inverse();
             }
 
             rep105_initial_alignment_ready_ = true;
 
             RCLCPP_INFO(
                 this->get_logger(),
-                "REP-105 initial alignment captured. align_map_to_odom_on_start=%s",
-                rep105_align_map_to_odom_on_start_ ? "true" : "false");
+                "REP-105 initial alignment captured. enabled=%s, mode=%s",
+                rep105_align_map_to_odom_on_start_ ? "true" : "false",
+                rep105_initial_alignment_mode_.c_str());
         }
 
         const tf2::Transform T_map_tracking_full =
@@ -1794,7 +1895,34 @@ private:
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             if (!feats_undistort || feats_undistort->empty()) {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                if (
+                    p_imu->gravity_alignment_enabled() &&
+                    !p_imu->gravity_alignment_ready())
+                {
+                    const fast_lio::GravityAlignmentResult & alignment =
+                        p_imu->gravity_alignment_result();
+                    RCLCPP_INFO_THROTTLE(
+                        this->get_logger(),
+                        *this->get_clock(),
+                        1000,
+                        "Waiting for stationary IMU initialization: status=%s, "
+                        "samples=%zu/%zu, duration=%.2f/%.2f s, "
+                        "acc_norm=%.4f m/s^2, gyro_norm=%.4f rad/s, "
+                        "resets=%zu, rejected=%zu",
+                        alignment.status.c_str(),
+                        alignment.samples,
+                        gravity_alignment_config_.min_samples,
+                        alignment.duration_sec,
+                        gravity_alignment_config_.min_duration_sec,
+                        alignment.latest_accel_norm_m_s2,
+                        alignment.latest_gyro_norm_rad_s,
+                        alignment.candidate_resets,
+                        alignment.rejected_samples);
+                }
+                else
+                {
+                    RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                }
                 return;
             }
 
@@ -1914,6 +2042,7 @@ private:
             tf2::Transform T_odom_tracking;
 
             if (!compute_map_alignment(T_map_lio, T_map_tracking, T_odom_tracking)) return;
+            maybe_finalize_gravity_metadata();
 
             /******* Publish odometry in real map frame *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_, lio_world_frame_, lio_body_frame_, rep105_publish_lio_tf_, T_map_tracking);
@@ -2005,6 +2134,173 @@ private:
             return rep105_map_frame_;
         }
         return lio_world_frame_;
+    }
+
+    Eigen::Vector3d gravity_unit_vector_in_output_frame() const
+    {
+        Eigen::Vector3d gravity_lio(0.0, 0.0, -1.0);
+        if (!p_imu->gravity_alignment_enabled())
+        {
+            const Eigen::Vector3d estimated_gravity(
+                state_point.grav[0], state_point.grav[1], state_point.grav[2]);
+            if (estimated_gravity.norm() > 1.0e-9)
+            {
+                gravity_lio = estimated_gravity.normalized();
+            }
+        }
+
+        if (!latest_map_alignment_ready_)
+        {
+            return gravity_lio;
+        }
+
+        const tf2::Vector3 gravity_output =
+            latest_T_map_lio_.getBasis() * tf2::Vector3(
+                gravity_lio.x(), gravity_lio.y(), gravity_lio.z());
+        Eigen::Vector3d result(
+            gravity_output.x(), gravity_output.y(), gravity_output.z());
+        return result.norm() > 1.0e-9 ? result.normalized() : gravity_lio;
+    }
+
+    void append_gravity_metadata(std::ostream & output, const std::string & indent) const
+    {
+        const bool ready =
+            !p_imu->gravity_alignment_enabled() || p_imu->gravity_alignment_ready();
+        const fast_lio::GravityAlignmentResult & alignment =
+            p_imu->gravity_alignment_result();
+        const Eigen::Vector3d gravity_output = gravity_unit_vector_in_output_frame();
+
+        output << indent << "gravity_alignment:\n"
+               << indent << "  enabled: " <<
+            (p_imu->gravity_alignment_enabled() ? "true" : "false") << "\n"
+               << indent << "  applied: " <<
+            (p_imu->gravity_alignment_enabled() && alignment.ready ? "true" : "false") << "\n"
+               << indent << "  status: \"" <<
+            (ready ? (alignment.ready ? alignment.status : "legacy_initialization") :
+            "pending_stationary_imu") << "\"\n"
+               << indent << "  source: \"" <<
+            (alignment.ready ? "stationary_imu_mean" : "not_available") << "\"\n"
+               << indent << "  gravity_magnitude_m_s2: " << std::setprecision(17) <<
+            gravity_alignment_config_.gravity_magnitude_m_s2 << "\n"
+               << indent << "  input_accel_scale_to_m_s2: " <<
+            gravity_alignment_config_.input_accel_scale_to_m_s2 << "\n"
+               << indent << "  gravity_unit_vector_output: [" <<
+            gravity_output.x() << ", " << gravity_output.y() << ", " <<
+            gravity_output.z() << "]\n"
+               << indent << "  output_frame: \"" << temporal_global_frame_id() << "\"\n"
+               << indent << "  stationary_required: " <<
+            (gravity_alignment_config_.require_stationary ? "true" : "false") << "\n"
+               << indent << "  initialization_samples: " << alignment.samples << "\n"
+               << indent << "  initialization_duration_sec: " << alignment.duration_sec << "\n"
+               << indent << "  rejected_samples: " << alignment.rejected_samples << "\n"
+               << indent << "  candidate_resets: " << alignment.candidate_resets << "\n"
+               << indent << "  mean_accel_imu_m_s2: [" <<
+            alignment.mean_accel_imu.x() << ", " << alignment.mean_accel_imu.y() <<
+            ", " << alignment.mean_accel_imu.z() << "]\n"
+               << indent << "  accel_std_imu_m_s2: [" <<
+            alignment.accel_std_imu.x() << ", " << alignment.accel_std_imu.y() <<
+            ", " << alignment.accel_std_imu.z() << "]\n"
+               << indent << "  mean_gyro_imu_rad_s: [" <<
+            alignment.mean_gyro_imu.x() << ", " << alignment.mean_gyro_imu.y() <<
+            ", " << alignment.mean_gyro_imu.z() << "]\n"
+               << indent << "  gyro_std_imu_rad_s: [" <<
+            alignment.gyro_std_imu.x() << ", " << alignment.gyro_std_imu.y() <<
+            ", " << alignment.gyro_std_imu.z() << "]\n"
+               << indent << "  rotation_world_from_imu_row_major: [";
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 3; ++column)
+            {
+                if (row != 0 || column != 0)
+                {
+                    output << ", ";
+                }
+                output << alignment.rotation_world_from_imu(row, column);
+            }
+        }
+        output << "]\n";
+    }
+
+    bool write_temporal_metadata_file(const std::filesystem::path & metadata_path)
+    {
+        std::ofstream metadata_file(
+            metadata_path, std::ios::out | std::ios::trunc);
+        if (!metadata_file.is_open())
+        {
+            return false;
+        }
+
+        metadata_file <<
+            "format_version: 2\n"
+            "frame_id: \"" << temporal_global_frame_id() << "\"\n"
+            "point_cloud_format: pcd_binary\n"
+            "point_record_size_bytes: 32\n"
+            "point_fields:\n"
+            "  - {name: x, type: float32, unit: m}\n"
+            "  - {name: y, type: float32, unit: m}\n"
+            "  - {name: z, type: float32, unit: m}\n"
+            "  - {name: intensity, type: float32}\n"
+            "  - {name: time_offset_sec, type: float32, unit: s}\n"
+            "  - {name: scan_id, type: uint32}\n"
+            "  - {name: timestamp_sec, type: float64, unit: s}\n"
+            "timestamp_reference: ROS time from the original LiDAR message\n"
+            "time_offset_reference: scan begin\n"
+            "trajectory_knots_enabled: " <<
+                (temporal_write_trajectory_knots_ ? "true" : "false") << "\n"
+            "trajectory_semantics: >-\n"
+            "  IMU-predicted intra-scan trajectory rigidly corrected so the final\n"
+            "  LiDAR pose matches the post-EKF FAST-LIO state. Interpolate trajectory.csv\n"
+            "  by scan_id and time_offset_sec to recover the LiDAR ray origin.\n"
+            "range_min_m: " << std::setprecision(17) << pcd_save_min_range_ << "\n"
+            "range_max_m: " << pcd_save_max_range_ << "\n"
+            "scan_stride: " << temporal_scan_stride_ << "\n"
+            "point_stride: " << temporal_point_stride_ << "\n"
+            "use_dense_cloud: " << (temporal_use_dense_cloud_ ? "true" : "false") << "\n";
+        append_gravity_metadata(metadata_file, "");
+        return metadata_file.good();
+    }
+
+    void maybe_finalize_gravity_metadata()
+    {
+        if (gravity_metadata_finalized_ || !latest_map_alignment_ready_)
+        {
+            return;
+        }
+        if (
+            p_imu->gravity_alignment_enabled() &&
+            !p_imu->gravity_alignment_ready())
+        {
+            return;
+        }
+
+        if (temporal_export_enabled_)
+        {
+            const std::filesystem::path metadata_path =
+                std::filesystem::path(temporal_output_dir_) / "metadata.yaml";
+            if (!write_temporal_metadata_file(metadata_path))
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Cannot finalize gravity metadata in %s",
+                    metadata_path.string().c_str());
+                return;
+            }
+        }
+
+        gravity_metadata_finalized_ = true;
+        const fast_lio::GravityAlignmentResult & alignment =
+            p_imu->gravity_alignment_result();
+        const Eigen::Vector3d gravity_output = gravity_unit_vector_in_output_frame();
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Gravity reference finalized: samples=%zu, duration=%.3f s, "
+            "mean_accel_imu=[%.6f, %.6f, %.6f], gravity_output=[%.9f, %.9f, %.9f]",
+            alignment.samples,
+            alignment.duration_sec,
+            alignment.mean_accel_imu.x(),
+            alignment.mean_accel_imu.y(),
+            alignment.mean_accel_imu.z(),
+            gravity_output.x(), gravity_output.y(), gravity_output.z());
     }
 
     void initialize_temporal_export()
@@ -2114,41 +2410,9 @@ private:
                 "chunk_index,filename,first_scan_id,last_scan_id,scan_count,point_count\n";
         }
 
+        if (!write_temporal_metadata_file(selected_path / "metadata.yaml"))
         {
-            std::ofstream metadata_file(
-                selected_path / "metadata.yaml",
-                std::ios::out | std::ios::trunc);
-            if (!metadata_file.is_open())
-            {
-                throw std::runtime_error("Cannot create temporal metadata.yaml");
-            }
-
-            metadata_file <<
-                "format_version: 1\n"
-                "frame_id: \"" << temporal_global_frame_id() << "\"\n"
-                "point_cloud_format: pcd_binary\n"
-                "point_record_size_bytes: 32\n"
-                "point_fields:\n"
-                "  - {name: x, type: float32, unit: m}\n"
-                "  - {name: y, type: float32, unit: m}\n"
-                "  - {name: z, type: float32, unit: m}\n"
-                "  - {name: intensity, type: float32}\n"
-                "  - {name: time_offset_sec, type: float32, unit: s}\n"
-                "  - {name: scan_id, type: uint32}\n"
-                "  - {name: timestamp_sec, type: float64, unit: s}\n"
-                "timestamp_reference: ROS time from the original LiDAR message\n"
-                "time_offset_reference: scan begin\n"
-                "trajectory_knots_enabled: " <<
-                    (temporal_write_trajectory_knots_ ? "true" : "false") << "\n"
-                "trajectory_semantics: >-\n"
-                "  IMU-predicted intra-scan trajectory rigidly corrected so the final\n"
-                "  LiDAR pose matches the post-EKF FAST-LIO state. Interpolate trajectory.csv\n"
-                "  by scan_id and time_offset_sec to recover the LiDAR ray origin.\n"
-                "range_min_m: " << std::setprecision(17) << pcd_save_min_range_ << "\n"
-                "range_max_m: " << pcd_save_max_range_ << "\n"
-                "scan_stride: " << temporal_scan_stride_ << "\n"
-                "point_stride: " << temporal_point_stride_ << "\n"
-                "use_dense_cloud: " << (temporal_use_dense_cloud_ ? "true" : "false") << "\n";
+            throw std::runtime_error("Cannot create temporal metadata.yaml");
         }
     }
 
@@ -2740,6 +3004,127 @@ private:
         }
     }
 
+    bool inject_ply_gravity_comments(
+        const std::filesystem::path & ply_path,
+        std::string & error_message) const
+    {
+        namespace fs = std::filesystem;
+        std::ifstream input(ply_path, std::ios::in | std::ios::binary);
+        if (!input.is_open())
+        {
+            error_message = "Cannot reopen temporary PLY for metadata injection.";
+            return false;
+        }
+
+        fs::path enriched_path = ply_path;
+        enriched_path += ".gravity";
+        std::ofstream output(
+            enriched_path, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            error_message = "Cannot create temporary gravity-annotated PLY.";
+            return false;
+        }
+
+        const Eigen::Vector3d gravity = gravity_unit_vector_in_output_frame();
+        std::string line;
+        bool found_end_header = false;
+        std::size_t header_bytes = 0U;
+        while (std::getline(input, line))
+        {
+            header_bytes += line.size() + 1U;
+            if (header_bytes > 1024U * 1024U)
+            {
+                error_message = "PLY header exceeds the 1 MiB safety limit.";
+                break;
+            }
+
+            if (line == "end_header" || line == "end_header\r")
+            {
+                output << std::setprecision(17)
+                       << "comment gravity " << gravity.x() << ' ' <<
+                    gravity.y() << ' ' << gravity.z() << "\n"
+                       << "comment gravity_magnitude_m_s2 " <<
+                    gravity_alignment_config_.gravity_magnitude_m_s2 << "\n"
+                       << "comment gravity_aligned " <<
+                    (p_imu->gravity_alignment_enabled() &&
+                    p_imu->gravity_alignment_ready() ? "true" : "false") << "\n"
+                       << "comment gravity_source " <<
+                    (p_imu->gravity_alignment_ready() ?
+                    "stationary_imu_mean" : "legacy_initialization") << "\n"
+                       << "comment frame_id " << temporal_global_frame_id() << "\n";
+                output << "end_header\n";
+                found_end_header = true;
+                break;
+            }
+            output << line << '\n';
+        }
+
+        if (found_end_header)
+        {
+            output << input.rdbuf();
+        }
+        input.close();
+        output.close();
+
+        if (!found_end_header || !output.good())
+        {
+            std::error_code cleanup_error;
+            fs::remove(enriched_path, cleanup_error);
+            if (error_message.empty())
+            {
+                error_message = "Invalid PLY header while injecting gravity metadata.";
+            }
+            return false;
+        }
+
+        std::error_code replace_error;
+        fs::remove(ply_path, replace_error);
+        replace_error.clear();
+        fs::rename(enriched_path, ply_path, replace_error);
+        if (replace_error)
+        {
+            error_message =
+                "Cannot replace temporary PLY after gravity metadata injection: " +
+                replace_error.message();
+            return false;
+        }
+        return true;
+    }
+
+    bool write_compact_map_metadata(
+        const std::filesystem::path & map_path,
+        std::string & error_message) const
+    {
+        std::filesystem::path metadata_path = map_path;
+        metadata_path += ".metadata.yaml";
+        std::ofstream metadata(
+            metadata_path, std::ios::out | std::ios::trunc);
+        if (!metadata.is_open())
+        {
+            error_message = "Cannot create " + metadata_path.string();
+            return false;
+        }
+
+        metadata << "format_version: 1\n"
+                 << "artifact: fast_lio_compact_map\n"
+                 << "map_file: \"" << map_path.filename().string() << "\"\n"
+                 << "frame_id: \"" << temporal_global_frame_id() << "\"\n"
+                 << "point_fields: [x, y, z, intensity]\n"
+                 << "voxel_size_m: " << std::setprecision(17) <<
+            pcd_save_voxel_size_ << "\n"
+                 << "accepted_observations: " << pcd_save_accepted_points_ << "\n"
+                 << "rep105_initial_alignment_mode: \"" <<
+            rep105_initial_alignment_mode_ << "\"\n";
+        append_gravity_metadata(metadata, "");
+        if (!metadata.good())
+        {
+            error_message = "Failed while writing " + metadata_path.string();
+            return false;
+        }
+        return true;
+    }
+
     bool save_accumulated_map(std::string & message)
     {
         if (!pcd_save_en)
@@ -2842,6 +3227,16 @@ private:
             return false;
         }
 
+        if (extension == ".ply")
+        {
+            std::string metadata_error;
+            if (!inject_ply_gravity_comments(temporary_path, metadata_error))
+            {
+                message = metadata_error;
+                return false;
+            }
+        }
+
         std::error_code rename_error;
         fs::rename(temporary_path, output_path, rename_error);
         if (rename_error)
@@ -2859,6 +3254,15 @@ private:
             message =
                 "Map data was written, but the temporary file could not be moved "
                 "to the final path: " + rename_error.message();
+            return false;
+        }
+
+        std::string metadata_error;
+        if (!write_compact_map_metadata(output_path, metadata_error))
+        {
+            message =
+                "Map data was saved, but its gravity metadata could not be written: " +
+                metadata_error;
             return false;
         }
 
@@ -3185,9 +3589,11 @@ private:
     bool rep105_project_map_to_2d_ = false;
     bool rep105_initial_alignment_ready_ = false;
     bool latest_map_alignment_ready_ = false;
+    bool gravity_metadata_finalized_ = false;
     double rep105_tf_timeout_sec_ = 0.05;
     tf2::Transform T_map_lio_initial_;
     tf2::Transform latest_T_map_lio_;
+    fast_lio::GravityAlignmentConfig gravity_alignment_config_;
 
     std::string lio_world_frame_ = "camera_init";
     std::string lio_body_frame_ = "body";
@@ -3196,6 +3602,7 @@ private:
     std::string rep105_map_frame_ = "map";
     std::string rep105_odom_frame_ = "odom";
     std::string rep105_robot_tracking_frame_ = "mid360";
+    std::string rep105_initial_alignment_mode_ = "yaw_only";
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
